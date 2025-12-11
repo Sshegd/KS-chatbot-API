@@ -52,6 +52,7 @@ client = None
 active_chats: Dict[str, Any] = {}
 
 app = FastAPI(title="KS Chatbot Backend", version="4.0")
+app.mount("/tts", StaticFiles(directory="tts_audio"), name="tts")
 
 
 # =========================================================
@@ -2765,51 +2766,73 @@ def route(query: str, user_id: str, lang: str, session_key: str):
         text, v, s = weather_crop_fusion(user_id, latest_crop, latest_stage, lang)
         return {"response_text": text, "voice": v, "suggestions": s}
         
-    #weather based idsease prediction
+        # ----------------------------------------------------------------------
+    # WEATHER-BASED DISEASE PREDICTION
+    # ----------------------------------------------------------------------
     if "disease" in q and "weather" in q:
-    logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
-    latest_crop = None; latest_ts = -1
-
-    for crop, entries in logs.items() if isinstance(logs, dict) else []:
-        if isinstance(entries, dict):
-            for _, data in entries.items():
-                ts = data.get("timestamp", 0)
-                if ts > latest_ts:
-                    latest_ts = ts
-                    latest_crop = data.get("cropName", crop)
-
-    if not latest_crop:
-        return {"response_text": "No crop found. Add farm activity.", "voice": False, "suggestions": ["Add activity"]}
-
-    farm = get_user_farm_details(user_id)
-    weather = fetch_weather_by_location(farm.get("district", "unknown"))
-
-    if not weather:
-        return {"response_text": "Weather unavailable.", "voice": False, "suggestions": ["Retry"]}
-
-    result = predict_disease_from_weather(latest_crop, weather, lang)
-    return {"response_text": result, "voice": False, "suggestions": ["Pest check", "Preventive spray"]}
-
-    # advanced pest/disease recognition (symptom-based)
-    if any(tok in q for tok in ["pest", "disease", "symptom", "leaf", "spots", "yellowing", "curl", "blight", "fungus"]):
-        # try to get crop from user's latest activity (if available)
         logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
-        latest_crop = None; latest_ts = -1
-        for crop_k, entries in (logs.items() if isinstance(logs, dict) else []):
+        latest_crop = None
+        latest_ts = -1
+
+        for crop, entries in logs.items() if isinstance(logs, dict) else []:
+            if isinstance(entries, dict):
+                for _, data in entries.items():
+                    ts = data.get("timestamp", 0)
+                    if ts > latest_ts:
+                        latest_ts = ts
+                        latest_crop = data.get("cropName", crop)
+
+        if not latest_crop:
+            return {
+                "response_text": "No crop found. Add farm activity.",
+                "voice": False,
+                "suggestions": ["Add activity"]
+            }
+
+        farm = get_user_farm_details(user_id)
+        weather = fetch_weather_by_location(farm.get("district", "unknown"))
+
+        if not weather:
+            return {
+                "response_text": "Weather unavailable.",
+                "voice": False,
+                "suggestions": ["Retry"]
+            }
+
+        result = predict_disease_from_weather(latest_crop, weather, lang)
+        return {
+            "response_text": result,
+            "voice": False,
+            "suggestions": ["Pest check", "Preventive spray"]
+        }
+
+    # ----------------------------------------------------------------------
+    # ADVANCED PEST/DISEASE DIAGNOSIS (SYMPTOM BASED)
+    # ----------------------------------------------------------------------
+    if any(tok in q for tok in ["pest", "disease", "symptom", "leaf", "spots", "yellowing", "curl", "blight", "fungus"]):
+        logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
+        latest_crop = None
+        latest_ts = -1
+
+        for crop_k, entries in logs.items() if isinstance(logs, dict) else []:
             if isinstance(entries, dict):
                 for aid, data in entries.items():
                     ts = data.get("timestamp", 0)
-                    if ts and ts > latest_ts:
+                    if ts > latest_ts:
                         latest_ts = ts
                         latest_crop = data.get("cropName", crop_k)
 
-        diag_text, voice, sugg = diagnose_advanced(query, user_crop=latest_crop, lang=language)
-        return {"response_text": diag_text, "voice": voice, "suggestions": sugg}
+        diag_text, voice, sugg = diagnose_advanced(query, user_crop=latest_crop, lang=lang)
+        return {
+            "response_text": diag_text,
+            "voice": voice,
+            "suggestions": sugg
+        }
 
-        # General agriculture knowledge intent
-        gen_text, gen_voice, gen_sugg = general_agri_knowledge_engine(query, lang)
-        if gen_text:
-            return {"response_text": gen_text, "voice": gen_voice, "suggestions": gen_sugg}
+    # General agriculture knowledge intent
+    gen_text, gen_voice, gen_sugg = general_agri_knowledge_engine(query, lang)
+    if gen_text:
+        return {"response_text": gen_text, "voice": gen_voice, "suggestions": gen_sugg}
 
 
     # Default → Gemini crop advisory or fallback text
@@ -2868,3 +2891,4 @@ async def chat_send(payload: ChatQuery):
 def startup():
     initialize_firebase_credentials()
     initialize_gemini()
+
