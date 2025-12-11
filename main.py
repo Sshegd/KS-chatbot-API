@@ -26,6 +26,7 @@ import difflib
 from collections import defaultdict, Counter
 from typing import Tuple
 from fastapi.staticfiles import StaticFiles
+
 # -----------------------------
 # Load environment
 # -----------------------------
@@ -52,7 +53,9 @@ client = None
 active_chats: Dict[str, Any] = {}
 
 app = FastAPI(title="KS Chatbot Backend", version="4.0")
+os.makedirs("tts_audio", exist_ok=True)
 app.mount("/tts", StaticFiles(directory="tts_audio"), name="tts")
+
 
 
 # =========================================================
@@ -156,6 +159,16 @@ def get_language(user_id: str) -> str:
 def get_user_farm_details(user_id: str) -> Dict[str, Any]:
     data = firebase_get(f"Users/{user_id}/farmDetails")
     return data if isinstance(data, dict) else {}
+    
+def get_user_location(user_id: str):
+    farm = get_user_farm_details(user_id)
+    if not farm:
+        return None
+    return {
+        "district": farm.get("district"),
+        "taluk": farm.get("taluk")
+    }
+
 
 
 # =========================================================
@@ -1578,6 +1591,14 @@ CROP_ET_BASE = {
     "ginger": 5.0
 }
 
+def get_mock_weather_for_district(district):
+    # Simple fallback mock weather (used if live fetch fails in irrigation schedule)
+    return {
+        "temp": 30,
+        "humidity": 70,
+        "wind": 8,
+        "rain_next_24h_mm": 0
+    }
 
 
 def fetch_weather_by_location(district: str):
@@ -1662,6 +1683,7 @@ def translate_weather_suggestions_kn(sugs):
         "Rain coming – postpone harvest.": "ಮಳೆ ಬರಲಿದೆ – ಕೊಯ್ತನ್ನು ಮುಂದೂಡಿ."
     }
     return [mapping.get(s, s) for s in sugs]
+    
 def weather_advisory(user_id: str, language: str):
     farm = get_user_farm_details(user_id)
     if not farm or "district" not in farm:
@@ -2329,6 +2351,12 @@ def _extract_symptom_keys(user_text: str, fuzzy_threshold: float = 0.6):
 
     return list(found)
 
+# -----------------------------
+# Add missing helper: match_symptoms (small wrapper used in diagnose_pest)
+# -----------------------------
+def match_symptoms(text):
+    return _extract_symptom_keys(text)
+
 # scoring engine
 def _score_candidates(symptom_keys: list, crop: Optional[str] = None):
     """
@@ -2390,6 +2418,7 @@ def diagnose_pest(user_text, language):
     suggestions = ["Pesticide recommendations", "Prevention steps", "Check crop stage"]
 
     return response, suggestions
+    
 # final diagnose function (public)
 def diagnose_advanced(user_text: str, user_crop: Optional[str] = None, lang: str = "en") -> Tuple[str, bool, list]:
     """
@@ -2529,14 +2558,39 @@ def crop_advisory(user_id: str, query: str, lang: str, session_key: str):
             return "AI not configured on server.", False, [], session_key
         if session_key not in active_chats:
             cfg = types.GenerateContentConfig(system_instruction=get_prompt(lang))
-            chat = client.chats.create(model="gemini-2.5-flash", config=cfg)
+            chat = client.chats.create(model="gemini-2.0-flash-lite", config=cfg)
             active_chats[session_key] = chat
         chat = active_chats[session_key]
-        resp = chat.send_message(query)
+        try:
+            resp=chat.send_message(query)
+        except:
+            error_str=str(e)
+             if "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower():
+                fallback_text = (
+                    "⚠️ AI quota limit reached for today.\n"
+                    "Please try again later. (Free-tier limit exceeded)"
+                    if lang == "en"
+                    else "⚠️ ಇಂದಿಗಿನ AI ಬಳಕೆ ಮಿತಿ ಮೀರಿದೆ.\n"
+                         "ಸ್ವಲ್ಪ ಹೊತ್ತಿನ ನಂತರ ಮತ್ತೆ ಪ್ರಯತ್ನಿಸಿ."
+                )
+                return fallback_text, False, ["Try again later"], session_key
+            safe_error = (
+                "AI is currently unavailable. Please try again later."
+                if lang == "en"
+                else "AI ಪ್ರಸ್ತುತ ಲಭ್ಯವಿಲ್ಲ. ದಯವಿಟ್ಟು ನಂತರ ಪ್ರಯತ್ನಿಸಿ."
+            )
+            return safe_error, False, [], session_key
         text = resp.text if hasattr(resp, "text") else str(resp)
         return text, False, ["Crop stage", "Pest check", "Soil test"], session_key
-    except Exception as e:
-        return f"AI error: {e}", False, [], session_key
+
+            
+    except Exception:
+        fallback = (
+            "AI could not process your request."
+            if lang == "en"
+            else "AI ನಿಮ್ಮ ವಿನಂತಿಯನ್ನು ಸಂಸ್ಕರಿಸಲು ಸಾಧ್ಯವಾಗಲಿಲ್ಲ."
+        )
+        return fallback, False, [], session_key
 
 
 # =========================================================
@@ -2891,4 +2945,5 @@ async def chat_send(payload: ChatQuery):
 def startup():
     initialize_firebase_credentials()
     initialize_gemini()
+
 
