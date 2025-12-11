@@ -29,7 +29,7 @@ FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "").rstrip("/")
 SERVICE_ACCOUNT_KEY = os.getenv("SERVICE_ACCOUNT_KEY")  # JSON string
 OPENWEATHER_KEY = os.getenv("OPENWEATHER_KEY")
 HF_API_KEY = os.getenv("HF_API_KEY")  # Hugging Face API key (router)
-HF_MODEL = os.getenv("HF_MODEL", "mistralai/Mixtral-8x7B-Instruct-v0.1")  # default Mixtral instruct
+HF_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1" # default Mixtral instruct
 TTS_DIR = os.getenv("TTS_DIR", "tts_audio")
 
 # ---- Logging ----
@@ -294,47 +294,34 @@ def hf_generate_text(prompt: str, max_new_tokens: int = 512, temperature: float 
     if not HF_API_KEY:
         return None, "Hugging Face API key not configured (HF_API_KEY)."
 
-    url = HF_ROUTER_URL_TEMPLATE.format(model=HF_MODEL)
-    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": max_new_tokens,
-            "temperature": temperature,
-            "do_sample": False
-        },
-        # optionally set "options": {"use_cache": False} or streaming -- kept simple
+    url = "https://router.huggingface.co/v1/chat/completions"
+   headers = {
+        "Authorization": f"Bearer {HF_API_KEY}",
+        "Content-Type": "application/json"
     }
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=45)
-        # log the status and errors
-        if r.status_code == 200:
-            data = r.json()
-            # router returns a list or dict depending on model; handle common shapes
-            if isinstance(data, dict):
-                # { "generated_text": "..." } or other shapes
-                text = data.get("generated_text") or data.get("text") or str(data)
-                return text, None
-            if isinstance(data, list) and len(data) > 0:
-                first = data[0]
-                if isinstance(first, dict) and "generated_text" in first:
-                    return first["generated_text"], None
-                # some HF models return {"generated_text": "..."} inside list
-                return str(first), None
-            return str(data), None
-        else:
-            logger.warning("HF non-200: %s %s", r.status_code, r.text[:400])
-            if r.status_code == 401:
-                return None, "Hugging Face authentication error (check HF_API_KEY)."
-            if r.status_code == 404:
-                return None, f"HF model {HF_MODEL} not found."
-            if r.status_code == 429:
-                return None, "Hugging Face quota / rate limit exceeded."
-            # propagate error body
-            return None, f"HF error {r.status_code}: {r.text}"
+
+    payload = {
+        "model": HF_MODEL,
+        "messages": [
+            {"role": "system", "content": "You are KrishiSakhi, a helpful agriculture assistant."},
+            {"role": "user", "content": query}
+        ],
+        "max_tokens": 500,
+        "temperature": 0.7
+    }
+     try:
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        if response.status_code != 200:
+            logger.warning(f"HF non-200: {response.status_code} {response.text}")
+            return None, f"HF error {response.status_code}: {response.text}"
+
+        data = response.json()
+        text = data["choices"][0]["message"]["content"]
+        return text, None
+
     except Exception as e:
-        logger.exception("HF generate exception: %s", e)
-        return None, f"HF request failed: {e}"
+        logger.warning(f"HF exception: {e}")
+        return None, str(e)
 
 # -------------------------
 # Application modules: soil, weather, market, pest/disease, timeline, fertilizer, irrigation, yield, diagnosis
@@ -851,5 +838,6 @@ def health():
     return {"status":"ok", "time": datetime.utcnow().isoformat(), "hf": bool(HF_API_KEY), "gtts": GTTS_AVAILABLE}
 
 # End of file
+
 
 
