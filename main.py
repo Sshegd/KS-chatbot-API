@@ -57,15 +57,29 @@ def initialize_gemini_client():
 
 def initialize_firebase_credentials():
     global credentials
-    if credentials is None:
-        try:
-            credentials = service_account.Credentials.from_service_account_file(
-                SERVICE_ACCOUNT_FILE_PATH,
-                scopes=SCOPES
-            )
-            print("Firebase Credentials Initialized.")
-        except Exception as e:
-            print(f"FATAL: Could not load Service Account Key: {e}")
+    if credentials is not None:
+        return
+
+    try:
+        # Get the JSON string from Render environment variable
+        service_account_json = os.getenv("SERVICE_ACCOUNT_KEY")
+
+        if not service_account_json:
+            raise Exception("SERVICE_ACCOUNT_KEY environment variable is missing.")
+
+        # Parse the JSON string
+        service_account_info = json.loads(service_account_json)
+
+        # Create credentials from JSON dict
+        credentials = service_account.Credentials.from_service_account_info(
+            service_account_info,
+            scopes=SCOPES
+        )
+
+        print("Firebase Credentials Initialized from environment variable.")
+
+    except Exception as e:
+        print(f"FATAL: Could not load Service Account Key from environment variable: {e}")
 
 def get_oauth2_access_token() -> str:
     global credentials
@@ -209,3 +223,4 @@ async def chat_with_gemini(query: ChatQuery):
 def startup_event():
     initialize_firebase_credentials()
     initialize_gemini_client()
+
