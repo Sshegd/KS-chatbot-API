@@ -12,13 +12,13 @@
 import os
 import json
 import uuid
+import traceback
 import requests
 import logging
 from typing import List, Optional, Dict, Any, Tuple
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from google import genai
-from gtts import gTTS
 from google.genai import types
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request as GoogleAuthRequest
@@ -26,50 +26,51 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import re
 import difflib
-from collections import defaultdict, Counter
+from collections import defaultdict
 from typing import Tuple
 from fastapi.staticfiles import StaticFiles
+
+
 
 # -----------------------------
 # Load environment
 # -----------------------------
 load_dotenv()
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+logger = logging.getLogger("ks-backend")
+logger.setLevel(logging.INFO)
+# ============================================================
+# ENVIRONMENT VARIABLES
+# ============================================================
+HF_API_KEY = os.getenv("HF_API_KEY") or os.getenv("HF_API_KEY".upper()) or os.getenv("HF_API_KEY".lower())
+HF_MODEL = os.getenv("HF_MODEL", "meta-llama/Llama-3-8B-Instruct")
 FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "").rstrip("/")
 SERVICE_ACCOUNT_KEY = os.getenv("SERVICE_ACCOUNT_KEY")
-OPENWEATHER_KEY = os.getenv("OPENWEATHER_KEY")
+OPENWEATHER_KEY = os.getenv("OPENWEATHER_KEY","")
 
 if not FIREBASE_DATABASE_URL:
     raise Exception("FIREBASE_DATABASE_URL missing")
-
-# ensure tts directory exists BEFORE mounting StaticFiles
-TTS_DIR = os.path.join(os.getcwd(), "tts_audio")
-os.makedirs(TTS_DIR, exist_ok=True)
-
-# -----------------------------
-# Logging
-# -----------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ks-backend")
-
-
-# -----------------------------
-# Globals
-# -----------------------------
+# Firebase scopes
 SCOPES = [
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/firebase.database"
 ]
-
+#global
 credentials = None
-gemini_client = None
-active_chats: Dict[str, Any] = {}
+app = FastAPI(title="KS Chatbot Backend", version="3.0")
+# HuggingFace inference endpoints
+HF_LLM_URL = "https://api-inference.huggingface.co/models/mistralai/Mixtral-8x7B-Instruct"
+HF_HEADERS = {"Authorization": f"Bearer {HF_API_KEY}"}
+HF_API_URL_BASE = "https://api-inference.huggingface.co/models"
+# TTS model
+HF_TTS_URL = "https://api-inference.huggingface.co/models/sarvamai/sarvam-tts-multilingual"
+# Active chat sessions
+active_chats: Dict[str, List[Dict[str, str]]] = {}   # stores conversation history
 
-app = FastAPI(title="KS Chatbot Backend", version="4.0")
 
+# Ensure tts_audio dir exists before mounting
+TTS_DIR = os.path.join(os.path.dirname(__file__), "tts_audio") if "__file__" in globals() else "./tts_audio"
+os.makedirs(TTS_DIR, exist_ok=True)
 app.mount("/tts", StaticFiles(directory=TTS_DIR), name="tts")
-
 
 
 # =========================================================
@@ -90,130 +91,123 @@ class ChatResponse(BaseModel):
     audio_url: Optional[str] = None
     metadata: Optional[Dict[str, Any]]
 
-
-def load_service_account_from_env(value: str):
+# =========================================================
+# TTS generation (optional, gTTS fallback)
+# =========================================================
+def generate_tts_audio(text: str, lang: str):
     """
-    Accept either:
-      - full JSON string in SERVICE_ACCOUNT_KEY env var
-      - a path to a JSON file
+    Try to use gTTS. If gTTS is not installed or fails, return None (no audio).
+    Returns URL path relative to static mount (e.g., /tts/tts_xxx.mp3) if saved successfully.
     """
-    if not value:
-        raise ValueError("SERVICE_ACCOUNT_KEY not provided")
-
-    # if it looks like a path and file exists, read it
-    if os.path.isfile(value):
-        with open(value, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-    # else try to parse as JSON string
+    if not text:
+        return None
     try:
-        return json.loads(value)
-    except json.JSONDecodeError as e:
-        raise ValueError("SERVICE_ACCOUNT_KEY is not a valid path or JSON string") from e
-    
-# =========================================================
-# TTS generation (gTTS)
-# =========================================================
-
-def generate_tts_audio(text: str, lang: str = "en") -> Optional[str]:
-    """
-    Generates an MP3 in ./tts_audio and returns the relative URL path (/tts/<filename>).
-    Requires gTTS to be installed. Falls back to None on error.
-    """
-    if gTTS is None:
-        logger.warning("gTTS not installed; skipping TTS generation.")
+        from gtts import gTTS
+    except Exception:
+        # gTTS not installed — skip TTS gracefully
+        print("gTTS not installed; skipping TTS generation.")
         return None
 
+    import uuid
+    safe_lang = "kn" if lang == "kn" else "en"
+    filename = f"tts_{uuid.uuid4().hex}.mp3"
+    filepath = os.path.join(TTS_DIR, filename)
     try:
-        # choose language code — support 'kn' (kannada) if required; gTTS supports 'kn'
-        tts_lang = "kn" if lang == "kn" else "en"
-        filename = f"tts_{uuid.uuid4().hex}.mp3"
-        filepath = os.path.join(TTS_DIR, filename)
-        t = gTTS(text=text, lang=tts_lang)
-        t.save(filepath)
-        logger.info("Saved TTS file: %s", filepath)
-        # return the mounted path (StaticFiles serves from /tts)
+        tts = gTTS(text=text, lang=safe_lang)
+        tts.save(filepath)
+        print("Saved TTS file:", filepath)
         return f"/tts/{filename}"
     except Exception as e:
-        logger.exception("TTS generation error: %s", e)
+        print("TTS generation error:", e)
         return None
 
-
-# =========================================================
-# Initialization helpers (Gemini + Firebase)
-# =========================================================
-
-
+# ============================================================
+# FIREBASE TOKEN HANDLING
+# ============================================================
 
 def initialize_firebase_credentials():
     global credentials
     if credentials:
         return
-    if not SERVICE_ACCOUNT_KEY:
-        raise Exception("SERVICE_ACCOUNT_KEY missing in environment")
-
     try:
-        info = load_service_account_from_env(SERVICE_ACCOUNT_KEY)
-        credentials_obj = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-        credentials = credentials_obj
-        logger.info("Loaded Firebase service account credentials.")
+        data = json.loads(SERVICE_ACCOUNT_KEY)
+        credentials = service_account.Credentials.from_service_account_info(
+            data, scopes=SCOPES
+        )
+        logger.info("Firebase credentials loaded.")
     except Exception as e:
-        logger.exception("Cannot load Firebase credentials: %s", e)
+        logger.error("Failed to load Firebase credentials: %s", e)
         raise
 
-
-def get_firebase_token() -> str:
-    """
-    Refreshes and returns an OAuth2 access token for the service account.
-    Used to call Firebase Realtime Database REST API with access_token param.
-    """
+def get_firebase_token():
     global credentials
     if not credentials:
         initialize_firebase_credentials()
     try:
-        if not credentials.valid:
+        if not credentials.token or credentials.expired:
             credentials.refresh(GoogleAuthRequest())
-        token = credentials.token
-        if not token:
-            # attempt refresh
-            credentials.refresh(GoogleAuthRequest())
-            token = credentials.token
-        return token
+        return credentials.token
     except Exception as e:
-        logger.exception("Token refresh failed: %s", e)
-        raise HTTPException(status_code=500, detail=f"Token refresh failed: {e}")
+        logger.error("Firebase token error: %s", e)
+        raise 
 
 
-# =========================================================
-# Firebase helper
-# =========================================================
 def firebase_get(path: str):
+    """GET helper for Firebase Realtime DB."""
     try:
         token = get_firebase_token()
         url = f"{FIREBASE_DATABASE_URL}/{path}.json"
-        r = requests.get(url, params={"access_token": token}, timeout=10)
-        r.raise_for_status()
-        return r.json()
+        res = requests.get(url, params={"access_token": token}, timeout=10)
+        res.raise_for_status()
+        return res.json()
     except Exception as e:
-        print("Firebase GET error:", e)
+        logger.error("Firebase GET error: %s", e)
         return None
 
 
-# Convenience wrappers
+
+# ============================================================
+# USER LANGUAGE & FARM DETAILS FETCHERS
+# ============================================================
 def get_language(user_id: str) -> str:
-    try:
-        ln = firebase_get(f"Users/{user_id}/preferredLanguage")
-        if isinstance(ln, str) and ln.lower().startswith("kn"):
-            return "kn"
-    except Exception:
-        pass
+    lang = firebase_get(f"Users/{user_id}/preferredLanguage")
+    if isinstance(lang, str):
+        return "kn" if lang.lower() == "kn" else "en"
     return "en"
 
 
-def get_user_farm_details(user_id: str) -> Dict[str, Any]:
+def get_user_location(user_id: str):
+    data = firebase_get(f"Users/{user_id}/farmDetails")
+    if not isinstance(data, dict):
+        return None
+    if "district" in data and "taluk" in data:
+        return {"district": data["district"], "taluk": data["taluk"]}
+    return None
+
+
+def get_user_farm_details(user_id: str):
     data = firebase_get(f"Users/{user_id}/farmDetails")
     return data if isinstance(data, dict) else {}
 
+
+# ============================================================
+# HELPER — CREATE TTS FOLDER ON STARTUP
+# ============================================================
+TTS_DIR = "tts_audio"
+if not os.path.exists(TTS_DIR):
+    os.makedirs(TTS_DIR)
+    logger.info("Created /tts_audio directory.")
+
+# expose static TTS audio files
+app.mount("/tts", StaticFiles(directory=TTS_DIR), name="tts")
+
+
+# ============================================================
+# HELPERS - LANGUAGE TEXT SELECTOR
+# ============================================================
+
+def pick(text_en: str, text_kn: str, lang: str):
+    return text_kn if lang == "kn" else text_en
 # Helper to get latest crop & stage from farmActivityLogs defensively
 def get_latest_crop_and_stage(user_id: str) -> Tuple[Optional[str], Optional[str]]:
     logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
@@ -235,126 +229,10 @@ def get_latest_crop_and_stage(user_id: str) -> Tuple[Optional[str], Optional[str
                 latest_crop = data.get("cropName") or crop_key
                 latest_stage = data.get("stage", "Unknown")
     return latest_crop, latest_stage
-    
-def get_user_location(user_id: str):
-    farm = get_user_farm_details(user_id)
-    if not farm:
-        return None
-    return {
-        "district": farm.get("district"),
-        "taluk": farm.get("taluk")
-    }
-# =========================================================
-# Gemini (GenAI) initialization — safe wrapper
-# =========================================================
-def initialize_gemini():
-    global gemini_client
-    try:
-        if not GEMINI_API_KEY:
-            logger.info("GEMINI_API_KEY not set; Gemini disabled.")
-            return
-        if genai is None:
-            logger.warning("google-genai SDK not installed; Gemini disabled.")
-            return
-        # Create client
-        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-        logger.info("Initialized Gemini client.")
-    except Exception as e:
-        logger.exception("Gemini init error: %s", e)
-        gemini_client = None
 
-
-
-# =========================================================
-# Existing modules: Soil center, weather placeholder, market, pest/disease, farm timeline
-# (kept concise; unchanged from earlier versions)
-# =========================================================
-
-def soil_testing_center(user_id: str, language: str):
-    loc = get_user_location(user_id)
-    if not loc:
-        msg = {
-            "en": "Farm location not found. Update district & taluk in farmDetails.",
-            "kn": "ಫಾರಂ ಸ್ಥಳದ ಮಾಹಿತಿ ಕಂಡುಬರಲಿಲ್ಲ. farmDetails ನಲ್ಲಿ ಜಿಲ್ಲೆ ಮತ್ತು ತಾಲೂಕು ನವೀಕರಿಸಿ."
-        }
-        return msg[language], True, ["Update farm details"]
-    district, taluk = loc["district"], loc["taluk"]
-    centers = firebase_get(f"SoilTestingCenters/Karnataka/{district}/{taluk}")
-    if not centers:
-        return ("No soil test center found for your area.", True, ["Update farm details"])
-    for _, info in centers.items():
-        if isinstance(info, dict):
-            text = f"{info.get('name')}\n{info.get('address')}\nContact: {info.get('contact')}"
-            return text, True, ["Directions", "Call center"]
-    return "No center data available.", True, []
-
-
-def weather_advice(language: str):
-    advice = {
-        "en": "Check forecast. If rain expected, delay irrigation. Mulching helps retain moisture.",
-        "kn": "ಹವಾಮಾನ ವರದಿ ನೋಡಿ. ಮಳೆ ಸಂಭವಿಸಿದರೆ ನೀರಾವರಿ ತಡೆಯಿರಿ. ಮಲ್ಚಿಂಗ್ ಮಣ್ಣು ತೇವಾವಸ್ಥೆ ಉಳಿಸುತ್ತದೆ."
-    }
-    return advice[language], True, ["Irrigation schedule", "Mulching"]
-
-
-PRICE_LIST = {
-    "chilli": 50, "paddy": 20, "ragi": 18, "areca": 470,
-    "banana": 12, "turmeric": 120, "cotton": 40, "sugarcane": 3
-}
-
-
-def market_price(query: str, language: str):
-    q = query.lower()
-    for crop, price in PRICE_LIST.items():
-        if crop in q:
-            if language == "kn":
-                return f"{crop.title()} ಸರಾಸರಿ ಬೆಲೆ: ₹{price}/ಕಿ.ಗ್ರಾಂ. ಸ್ಥಳೀಯ APMC ಪರಿಶೀಲಿಸಿ.", False, ["Sell at APMC", "Quality Check"]
-            return f"Approx price for {crop.title()}: ₹{price}/kg. Verify with local APMC.", False, ["Sell at APMC", "Quality Check"]
-    fallback = {"en": "Please specify the crop name (e.g., 'chilli price').", "kn": "ದಯವಿಟ್ಟು ಬೆಳೆ ಹೆಸರು ನೀಡಿ (ಉದಾ: 'ಮೆಣಸಿನ ಬೆಲೆ')."}
-    return fallback[language], False, ["Chilli price", "Areca price"]
-
-
-def pest_disease(query: str, language: str):
-    q = query.lower()
-    if "curl" in q:
-        en = ("Symptoms indicate leaf curl virus or sucking pests. Remove severely affected shoots and apply neem oil spray.")
-        kn = ("ಎಲೆ ಕರ್ಭಟ ವೈರಸ್ ಅಥವಾ ಸ್ಯಕ್ಕಿಂಗ್ ಕೀಟಗಳ ಸೂಚನೆ. ಗಂಭೀರವಾದ ಭಾಗಗಳನ್ನು ತೆಗೆದುಹಾಕಿ ಮತ್ತು ನೀಮ್ ಎಣ್ಣೆ ಸಿಂಪಡಿಸಿ.")
-        return (kn if language == "kn" else en), True, ["Neem spray", "Contact Krishi Adhikari"]
-    if "yellow" in q or "yellowing" in q:
-        en = "Yellowing leaves may indicate nutrient deficiency or overwatering. Check soil moisture and consider soil test."
-        kn = "ಎಲೆಗಳು ಹಳದಿ ಆಗುವುದು ಪೋಷಕಾಂಶ ಕೊರತೆ ಅಥವಾ ಹೆಚ್ಚಾಗಿ ನೀರು 때문."
-        return (kn if language == "kn" else en), True, ["Soil test", "Nitrogen application"]
-    fallback = {"en": "Provide more symptom details or upload a photo.", "kn": "ಲಕ್ಷಣಗಳ ಬಗ್ಗೆ ಹೆಚ್ಚಿನ ವಿವರ ನೀಡಿ ಅಥವಾ ಫೋಟೋ ಅಪ್ಲೋಡ್ ಮಾಡಿ."}
-    return fallback[language], True, ["Upload photo"]
-
-
-def farm_timeline(user_id: str, language: str):
-    logs = firebase_get(f"Users/{user_id}/farmActivityLogs")
-    if not logs:
-        return ("No activity logs found." if language == "en" else "ಚಟುವಟಿಕೆ ಲಾಗ್ ಕಂಡುಬರಲಿಲ್ಲ."), False, ["Add activity"]
-    summaries = []
-    for crop, entries in logs.items():
-        if isinstance(entries, dict):
-            latest_entry = None
-            latest_ts = -1
-            for act_id, data in entries.items():
-                ts = data.get("timestamp", 0)
-                if ts and ts > latest_ts:
-                    latest_ts = ts
-                    latest_entry = data
-            if latest_entry:
-                crop_name = latest_entry.get("cropName", crop)
-                act = latest_entry.get("subActivity", "")
-                stage = latest_entry.get("stage", "")
-                if language == "kn":
-                    summaries.append(f"{crop_name}: ಇತಿಚ್ಚಿನ ಚಟುವಟಿಕೆ {act} (ಹಂತ: {stage})")
-                else:
-                    summaries.append(f"{crop_name}: latest activity {act} (stage: {stage})")
-    if not summaries:
-        return ("No recent activities found." if language == "en" else "ಯಾವುದೇ ಇತ್ತೀಚಿನ ಚಟುವಟಿಕೆಗಳು ಇಲ್ಲ."), False, ["Add activity"]
-    return ("\n".join(summaries), False, ["View full timeline"])
-
-
+# =====================================================
+#knowledge base
+# =====================================================
 # =========================================================
 # Stage-wise recommendation engine (existing)
 # =========================================================
@@ -1048,21 +926,6 @@ STAGE_RECOMMENDATIONS = {
         }
     }
 }
-
-
-
-def stage_recommendation_engine(crop_name: str, stage: str, lang: str) -> str:
-    crop = (crop_name or "").lower()
-    st = (stage or "").lower()
-    if crop in STAGE_RECOMMENDATIONS and st in STAGE_RECOMMENDATIONS[crop]:
-        return STAGE_RECOMMENDATIONS[crop][st][lang]
-    fallback = {
-        "en": f"No specific recommendation for {crop_name} at stage '{stage}'.",
-        "kn": f"{crop_name} ಹಂತ '{stage}' ಗೆ ವಿಶೇಷ ಸಲಹೆ ಲಭ್ಯವಿಲ್ಲ."
-    }
-    return fallback[lang]
-
-
 # =========================================================
 # NEW MODULE: Fertilizer calculator per stage
 # - Simple heuristics: N-P-K per hectare based on crop and stage.
@@ -1381,42 +1244,6 @@ FERTILIZER_BASE = {
     }
 }
 
-
-
-def fertilizer_calculator(crop: str, stage: str, user_id: str, lang: str) -> Tuple[str, bool, List[str]]:
-    # Check farm area (hectares)
-    farm = get_user_farm_details(user_id)
-    area_ha = None
-    # farmDetails may store area as 'area' (hectares) or 'areaInHectares'; be defensive
-    if isinstance(farm, dict):
-        try:
-            area_ha = farm.get("areaInHectares") or farm.get("area") or farm.get("landSizeHectares")
-        except Exception:
-            area_ha = 1.0
-
-    crop_l = (crop or "").lower()
-    stage_l = (stage or "").lower()
-
-    if crop_l in FERTILIZER_BASE and stage_l in FERTILIZER_BASE[crop_l]:
-        N_per_ha, P_per_ha, K_per_ha = FERTILIZER_BASE[crop_l][stage_l]
-        N = round(N_per_ha * area_ha, 2)
-        P = round(P_per_ha * area_ha, 2)
-        K = round(K_per_ha * area_ha, 2)
-        if lang == "kn":
-            text = (f"{crop.title()} - {stage.title()} ಹಂತಕ್ಕೆ ಶಿಫಾರಸು (ಒಟ್ಟು ಪ್ರದೇಶ {area_ha} ha):\n"
-                    f"N: {N} kg, P2O5: {P} kg, K2O: {K} kg.\nದಯವಿಟ್ಟು ಮಣ್ಣಿನ ಪರೀಕ್ಷೆ ಆಧರಿಸಿ ಸರಿ ಮಾಡಿ.")
-        else:
-            text = (f"Fertilizer recommendation for {crop.title()} ({stage.title()}) for {area_ha} ha:\n"
-                    f"N: {N} kg, P2O5: {P} kg, K2O: {K} kg.\nAdjust based on soil test results.")
-        return text, False, ["Soil test", "Buy fertilizer"]
-    
-    fallback = {
-        "en": "No fertilizer template available for this crop/stage. Provide crop and stage or run soil test.",
-        "kn": "ಈ ಬೆಳೆ/ಹಂತಕ್ಕೆ ಎರೆ ಖರೀದಿಗಾಗಿ ರೂಪರೆಖೆ ಲಭ್ಯವಿಲ್ಲ. ದಯವಿಟ್ಟು ಮಣ್ಣು ಪರೀಕ್ಷೆ ಮಾಡಿ."
-    }
-    return fallback[lang], False, ["Soil test"]
-
-
 # =========================================================
 # NEW MODULE: Pesticide recommendation engine
 # - Map common pests/diseases to recommendations (preferred bio options included)
@@ -1608,23 +1435,6 @@ PESTICIDE_DB = {
     }
 }
 
-
-
-def pesticide_recommendation(crop: str, pest: str, lang: str) -> Tuple[str, bool, List[str]]:
-    pest_l = (pest or "").lower()
-    if pest_l in PESTICIDE_DB:
-        return PESTICIDE_DB[pest_l][lang if lang in ["en", "kn"] else "en"], False, ["Use bio-pesticide", "Contact advisor"]
-    # fuzzy match: check substring
-    for key in PESTICIDE_DB.keys():
-        if key in pest_l:
-            return PESTICIDE_DB[key][lang if lang in ["en", "kn"] else "en"], False, ["Use bio-pesticide", "Contact advisor"]
-    fallback = {
-        "en": "Pest not recognized. Provide photo or pest name (e.g., 'aphid', 'fruit borer').",
-        "kn": "ಕೀಟ ಗುರುತಿಸಲಾಗಲಿಲ್ಲ. ಫೋಟೋ ಅಥವಾ ಕೀಟದ ಹೆಸರು ನೀಡಿ (ಉದಾ: aphid)."
-    }
-    return fallback[lang], False, ["Upload photo", "Contact Krishi Adhikari"]
-
-
 # =========================================================
 # NEW MODULE: Irrigation schedule module
 # - Suggest irrigation frequency/amount based on crop, stage, soil type, and simple weather forecast (mock)
@@ -1683,109 +1493,6 @@ CROP_ET_BASE = {
     "turmeric": 5.0,
     "ginger": 5.0
 }
-
-def get_mock_weather_for_district(district):
-    # Simple fallback mock weather (used if live fetch fails in irrigation schedule)
-    return {
-        "temp": 30,
-        "humidity": 70,
-        "wind": 8,
-        "rain_next_24h_mm": 0
-    }
-
-
-
-
-
-
-def translate_weather_suggestions_kn(sugs):
-    mapping = {
-        "High heat – give afternoon irrigation and mulch.": "ಹೆಚ್ಚು ಬಿಸಿಲು – ಮಧ್ಯಾಹ್ನ ನೀರಾವರಿ ಮಾಡಿ ಮತ್ತು ಮಲ್ಚಿಂಗ್ ಮಾಡಿ.",
-        "Low temperature – avoid fertilizer today.": "ಕಡಿಮೆ ತಾಪಮಾನ – ಇಂದು ರಸಗೊಬ್ಬರ ಬಳಕೆ ಬೇಡ.",
-        "Rainfall occurring – stop irrigation for 24 hours.": "ಮಳೆ ಬರುತ್ತಿದೆ – 24 ಗಂಟೆಗಳ ಕಾಲ ನೀರಾವರಿ ನಿಲ್ಲಿಸಿ.",
-        "No rain – irrigation recommended today.": "ಮಳೆಯಿಲ್ಲ – ಇಂದು ನೀರಾವರಿ ಮಾಡಿರಿ.",
-        "High humidity – fungal disease chances are high.": "ಹೆಚ್ಚು ತೇವಾಂಶ – ಫಂಗಸ್ ರೋಗದ ಸಾಧ್ಯತೆ ಹೆಚ್ಚು.",
-        "Low humidity – increase irrigation frequency.": "ಕಡಿಮೆ ತೇವಾಂಶ – ನೀರಾವರಿ ಪ್ರಮಾಣ ಹೆಚ್ಚಿಸಿ.",
-        "High wind – avoid spraying pesticides.": "ಬಲವಾದ ಗಾಳಿ – ಕೀಟನಾಶಕ ಸಿಂಪಡಣೆ ಬೇಡ.",
-        "Rain during flowering – flower drop likely.": "ಹೂ ಹಂತದಲ್ಲಿ ಮಳೆ – ಹೂ ಬಿದ್ದು ಹೋಗುವ ಸಾಧ್ಯತೆ.",
-        "Rain coming – postpone harvest.": "ಮಳೆ ಬರಲಿದೆ – ಕೊಯ್ತನ್ನು ಮುಂದೂಡಿ."
-    }
-    return [mapping.get(s, s) for s in sugs]
-    
-def weather_advisory(user_id: str, language: str):
-    farm = get_user_farm_details(user_id)
-    if not farm or "district" not in farm:
-        msg = {
-            "en": "Farm district missing. Update farm details.",
-            "kn": "ಫಾರಂ ಜಿಲ್ಲೆಯ ಮಾಹಿತಿ ಇಲ್ಲ. farmDetails ನವೀಕರಿಸಿ."
-        }
-        return msg[language], [], False
-
-    district = farm["district"]
-    weather = fetch_weather_by_location(district)
-
-    if not weather:
-        return ("Unable to fetch weather data.", [], False)
-
-    suggestions = weather_suggestion_engine(weather, None, language)
-
-    if language == "kn":
-        report = (
-            f"{district} ಹವಾಮಾನ:\n"
-            f"ಸ್ಥಿತಿ: {weather['description']}\n"
-            f"ತಾಪಮಾನ: {weather['temp']}°C\n"
-            f"ತೇವಾಂಶ: {weather['humidity']}%\n"
-            f"ಗಾಳಿ: {weather['wind']} km/h\n"
-            f"ಮಳೆ (1h): {weather['rain']} mm\n"
-        )
-    else:
-        report = (
-            f"Weather in {district}:\n"
-            f"Condition: {weather['description']}\n"
-            f"Temperature: {weather['temp']}°C\n"
-            f"Humidity: {weather['humidity']}%\n"
-            f"Wind: {weather['wind']} km/h\n"
-            f"Rain (1h): {weather['rain']} mm\n"
-        )
-
-    return report, suggestions, True
-
-
-def irrigation_schedule(crop: str, stage: str, user_id: str, lang: str) -> Tuple[str, bool, List[str]]:
-    farm = get_user_farm_details(user_id)
-    soil = (farm.get("soilType") or "loamy").lower()
-    try:
-        area_ha = float(farm.get("areaInHectares") or farm.get("area") or 1.0)
-    except Exception:
-        area_ha = 1.0
-    district = farm.get("district") or "unknown"
-    weather = get_mock_weather_for_district(district)
-    rain_next_24 = weather.get("rain_next_24h_mm", 0)
-    crop_l = (crop or "").lower()
-    base_et = CROP_ET_BASE.get(crop_l, 4)
-    soil_factor = SOIL_WATER_HOLDING.get(soil, 1.0)
-    stage_mult = 1.0
-    s_low = (stage or "").lower()
-    if "nursery" in s_low or "vegetative" in s_low:
-        stage_mult = 1.2
-    elif "flower" in s_low or "panicle" in s_low:
-        stage_mult = 1.1
-    elif "harvest" in s_low:
-        stage_mult = 0.8
-    required_mm = base_et * stage_mult * (1.0 / soil_factor)
-    if rain_next_24 >= 10:
-        suggestion = {"en": "Rain expected soon. Delay irrigation and monitor soil moisture.", "kn": "ಶೀಘ್ರದಲ್ಲೇ ಮಳೆಯ ಸಂಭವನೆ. ನೀರಾವರಿ ತಡೆಯಿರಿ ಮತ್ತು ಮಣ್ಣು ஈರತೆಯನ್ನು ಪರಿಶೀಲಿಸಿರಿ."}
-        return suggestion[lang], False, ["Soil moisture check", "Delay irrigation"]
-    liters_per_ha = required_mm * 10000
-    total_liters = round(liters_per_ha * area_ha, 1)
-    if lang == "kn":
-        text = (f"{crop.title()} ({stage}) - ಶಿಫಾರಸು: ಪ್ರತಿ ದಿನ {round(required_mm,1)} mm ನೀರಾವರಿ (ಸಮಾನವಾದ ~{total_liters} ಲೀಟರ್/ದಿನಕ್ಕೆ {area_ha} ha).")
-    else:
-        text = (f"Recommendation for {crop.title()} ({stage}): approx {round(required_mm,1)} mm/day irrigation "
-                f"(~{total_liters} liters/day for {area_ha} ha). Adjust if rain or soil moisture indicates otherwise.")
-    return text, False, ["Soil moisture sensor", "Irrigation logs"]
-
-
 # =========================================================
 # NEW MODULE: Simple Yield prediction (heuristic)
 # - Uses base yield per crop and multipliers from fertilizer/irrigation/pest control flags.
@@ -1840,59 +1547,6 @@ BASE_YIELD_TON_PER_HA = {
     "turmeric": 8.0,
     "ginger": 15.0
 }
-
-
-
-def yield_prediction(crop: str, user_id: str, lang: str) -> Tuple[str, bool, List[str]]:
-    farm = get_user_farm_details(user_id)
-    try:
-        area_ha = float(farm.get("areaInHectares") or farm.get("area") or 1.0)
-    except Exception:
-        area_ha = 1.0
-    crop_l = (crop or "").lower()
-    base = BASE_YIELD_TON_PER_HA.get(crop_l, 2.0)
-    last_fert = firebase_get(f"Users/{user_id}/lastFertilizerApplied") or {}
-    fert_ok = isinstance(last_fert, dict) and last_fert.get("applied", False)
-    irrigation_logs = firebase_get(f"Users/{user_id}/irrigationLogs") or {}
-    irrigation_ok = False
-    if isinstance(irrigation_logs, dict):
-        now = datetime.utcnow().timestamp()
-        for v in irrigation_logs.values():
-            try:
-                ts = int(v.get("timestamp", 0) or 0)
-            except Exception:
-                ts = 0
-            if now - ts < 14 * 24 * 3600:
-                irrigation_ok = True
-                break
-    pest_incidents = firebase_get(f"Users/{user_id}/pestIncidents") or {}
-    pest_control_ok = not (isinstance(pest_incidents, dict) and len(pest_incidents) > 0)
-    fert_factor = 1.1 if fert_ok else 0.9
-    irr_factor = 1.05 if irrigation_ok else 0.9
-    pest_factor = 0.95 if not pest_control_ok else 1.0
-    predicted_ton_per_ha = round(base * fert_factor * irr_factor * pest_factor, 2)
-    total_tonnage = round(predicted_ton_per_ha * area_ha, 2)
-    if lang == "kn":
-        text = (f"ಅಂದಾಜು ಉತ್ಪಾದನೆ: {predicted_ton_per_ha} ಟನ್/ha. ಒಟ್ಟು ~{total_tonnage} ಟನ್ ನಿಮ್ಮ {area_ha} ha ಪ್ರದೇಶಕ್ಕೆ.\n"
-                f"(ಕಾರಕಗಳು: fertilizer_ok={fert_ok}, irrigation_ok={irrigation_ok}, pest_ok={pest_control_ok})")
-    else:
-        text = (f"Estimated yield: {predicted_ton_per_ha} ton/ha. Total ~{total_tonnage} ton for {area_ha} ha.\n"
-                f"(Factors: fertilizer_ok={fert_ok}, irrigation_ok={irrigation_ok}, pest_ok={pest_control_ok})")
-    return text, False, ["Improve irrigation", "Soil test", "Pest control"]
-
-def fetch_weather_by_location(district: str):
-    if not OPENWEATHER_KEY:
-        return None
-    try:
-        url = f"https://api.openweathermap.org/data/2.5/weather?q={district}&appid={OPENWEATHER_KEY}&units=metric"
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        if data.get("cod") != 200:
-            return None
-        return {"temp": data["main"]["temp"], "humidity": data["main"]["humidity"], "wind": data["wind"]["speed"], "condition": data["weather"][0]["main"], "description": data["weather"][0]["description"], "rain": data.get("rain", {}).get("1h", 0)}
-    except Exception:
-        return None
-
 # =========================================================
 # CROP–DISEASE PREDICTION FROM WEATHER (Temp/Humidity/Rain)
 # =========================================================
@@ -2170,51 +1824,6 @@ DISEASE_WEATHER_RISK = {
         {"cond": "high_temp", "disease": "anthracnose"}
     ]
 }
-def classify_weather_condition(weather):
-    temp = weather["temp"]
-    humidity = weather["humidity"]
-    rain = weather["rain"]
-
-    conds = []
-
-    if humidity > 80:
-        conds.append("high_humidity")
-
-    if temp > 32 and humidity < 50:
-        conds.append("high_temp_low_humidity")
-
-    if temp > 34:
-        conds.append("high_temp")
-
-    if rain > 2:
-        conds.append("rainy")
-
-    if rain > 8:
-        conds.append("continuous_rain")
-        conds.append("heavy_rain")
-
-    return conds
-
-
-def predict_disease_from_weather(crop, weather, lang):
-    crop_l = (crop or "").lower()
-    if crop_l not in DISEASE_WEATHER_RISK:
-        return None
-    weather_conditions = classify_weather_condition(weather)
-    risks = []
-    for rule in DISEASE_WEATHER_RISK[crop_l]:
-        if rule["cond"] in weather_conditions:
-            risks.append(rule["disease"])
-    if not risks:
-        msg = {"en": f"No major disease risk predicted for {crop.title()} based on current weather.", "kn": f"ಪ್ರಸ್ತುತ ಹವಾಮಾನ ಆಧಾರದಲ್ಲಿ {crop} ಬೆಳೆಗೂ ಮುಖ್ಯ ರೋಗ ಅಪಾಯ ಕಂಡುಬಂದಿಲ್ಲ."}
-        return msg[lang]
-    if lang == "kn":
-        text = f"{crop} ಬೆಳೆ ಹವಾಮಾನ ಆಧಾರಿತ ರೋಗ ಅಪಾಯ:\n\n" + "\n".join([f"⚠ {d} ಅಪಾಯ ಹೆಚ್ಚು" for d in risks]) + "\n\nತಡೆ ಕ್ರಮ: ನೀಮ್ ಸಿಂಪಡಣೆ / ಗಾಳಿ ಸಂಚಾರ ಹೆಚ್ಚಿಸಿ / ಜಲಾವೃತ ತಪ್ಪಿಸಿ."
-    else:
-        text = f"Disease Risk Prediction for {crop.title()}:\n\n" + "\n".join([f"⚠ High risk of {d}" for d in risks]) + "\n\nPreventive actions: Neem spray / Improve aeration / Avoid waterlogging."
-    return text
-
-
 # =========================================================
 #NEW MODULE :SYMPTOM RECOGNITION
 # =========================================================
@@ -2294,427 +1903,6 @@ DISEASE_META = {
     "anthracnose": {"type": "fungal", "note": "Fruit rot, sunken lesions"}
     # add more meta as needed
 }
-def _normalize_text(text: str) -> str:
-    text = text.lower().strip()
-    text = re.sub(r"[^a-z0-9\s/-]", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text
-
-def _tokenize(text: str):
-    return text.split()
-
-
-# match symptom phrases (exact, synonym, fuzzy)
-def _extract_symptom_keys(user_text: str, fuzzy_threshold: float = 0.6):
-    """
-    Returns list of matched canonical symptom keys (may contain duplicates).
-    Uses:
-      - exact substring match against synonyms and canonical keys
-      - fuzzy matching via difflib for partial matches
-    """
-    text = _normalize_text(user_text)
-    found = []
-
-    # check synonyms first (longest match priority)
-    for phrase, canonical in sorted(SYMPTOM_SYNONYMS.items(), key=lambda x: -len(x[0])):
-        if phrase in text:
-            found.append(canonical)
-
-    # check canonical keys exact substring
-    for key in SYMPTOM_DB.keys():
-        if key in text:
-            found.append(key)
-
-    # fuzzy match short phrases -> to capture variants
-    tokens = _tokenize(text)
-    joined = " ".join(tokens)
-    for key in SYMPTOM_DB.keys():
-        ratio = difflib.SequenceMatcher(None, joined, key).ratio()
-        if ratio >= fuzzy_threshold:
-            found.append(key)
-
-    # additional n-gram matching: 2-4 gram window
-    n = len(tokens)
-    for L in range(2, min(6, n+1)):
-        for i in range(n - L + 1):
-            gram = " ".join(tokens[i:i+L])
-            for phrase, canonical in SYMPTOM_SYNONYMS.items():
-                if gram == phrase:
-                    found.append(canonical)
-
-    return list(found)
-
-# -----------------------------
-# Add missing helper: match_symptoms (small wrapper used in diagnose_pest)
-# -----------------------------
-def match_symptoms(text):
-    return _extract_symptom_keys(text)
-
-def _score_candidates(symptom_keys: list, crop: Optional[str] = None):
-    from collections import defaultdict
-    scores = defaultdict(float)
-    evidence = defaultdict(list)
-    for sk in symptom_keys:
-        mapped = SYMPTOM_DB.get(sk, [])
-        for cand in mapped:
-            base_weight = 1.0
-            if len(sk.split()) >= 2:
-                base_weight += 0.25
-            scores[cand] += base_weight
-            evidence[cand].append(f"symptom:{sk}")
-    if crop:
-        crop_l = crop.lower()
-        crop_map = CROP_SYMPTOM_WEIGHT.get(crop_l, {})
-        for cand, boost in crop_map.items():
-            scores[cand] += boost
-            evidence[cand].append(f"crop_boost:{crop_l}")
-    if not scores:
-        return []
-    total = sum(scores.values())
-    ranked = []
-    for cand, sc in sorted(scores.items(), key=lambda x: -x[1]):
-        confidence = round(min(0.99, sc / (total + 1e-6)), 2)
-        ranked.append((cand, round(sc, 2), confidence, evidence.get(cand, [])))
-    return ranked
-
-
-
-def diagnose_pest(user_text, language):
-    matches = match_symptoms(user_text)
-    if not matches:
-        fallback = {
-            "en": "I could not identify the pest from the symptoms. Please describe more clearly or send a photo.",
-            "kn": "ಲಕ್ಷಣಗಳಿಂದ ಕೀಟವನ್ನು ಗುರುತಿಸಲು ಸಾಧ್ಯವಾಗಲಿಲ್ಲ. ದಯವಿಟ್ಟು ಹೆಚ್ಚಿನ ವಿವರ ನೀಡಿ ಅಥವಾ ಫೋಟೋ ಕಳುಹಿಸಿ."
-        }
-        return fallback[language], ["Upload photo", "Show common pest symptoms"]
-
-    # Take top 1–2 matches
-    result = matches[:2]
-
-    response = f"Possible issues based on symptoms:\n" + "\n".join(f"- {d}" for d in result)
-    suggestions = ["Pesticide recommendations", "Prevention steps", "Check crop stage"]
-
-    return response, suggestions
-    
-# final diagnose function (public)
-def diagnose_advanced(user_text: str, user_crop: Optional[str] = None, lang: str = "en") -> Tuple[str, bool, list]:
-    if not user_text or not user_text.strip():
-        fallback = {"en": "Please describe the symptoms (leaf color, spots, pests seen, part affected).", "kn": "ದಯವಿಟ್ಟು ಲಕ್ಷಣಗಳನ್ನು ವಿವರಿಸಿ (ಎಲೆ ಬಣ್ಣ, ಕಲೆ, ಕಂಡ ಹಾಳುಕಾರಕಗಳು, ಭಾಗ ಪ್ರಭಾವಿತವಾಗಿರುವುದು)."}
-        return fallback.get(lang, fallback["en"]), False, ["Upload photo", "Describe symptoms"]
-    symptom_keys = _extract_symptom_keys(user_text, fuzzy_threshold=0.58)
-    if not symptom_keys:
-        clauses = re.split(r"[,.;:/\\-]", user_text)
-        for clause in clauses:
-            keys = _extract_symptom_keys(clause, fuzzy_threshold=0.55)
-            symptom_keys.extend(keys)
-    symptom_keys = list(dict.fromkeys(symptom_keys))
-    if not symptom_keys:
-        fallback = {"en": "Couldn't identify clear symptoms. Please provide more details or upload a photo.", "kn": "ನಿರ್ದಿಷ್ಟ ಲಕ್ಷಣಗಳು ಗುರುತಿಸಲಾಗಲಿಲ್ಲ. ದಯವಿಟ್ಟು ಹೆಚ್ಚಿನ ವಿವರ ನೀಡಿ ಅಥವಾ ಫೋಟೋ ಅಪ್ಲೋಡ್ ಮಾಡಿ."}
-        return fallback.get(lang, fallback["en"]), False, ["Upload photo", "Contact Krishi Adhikari"]
-    ranked = _score_candidates(symptom_keys, user_crop)
-    if not ranked:
-        fallback = {"en": "No candidate pests/diseases found for those symptoms.", "kn": "ಆ ಲಕ್ಷಣಗಳಿಗೆ ಯೋಗ್ಯವಾದ ಕೀಟ/ರೋಗಗಳು ಕಂಡುಬರಲಿಲ್ಲ."}
-        return fallback.get(lang, fallback["en"]), False, ["Upload photo", "Contact Krishi Adhikari"]
-    top_k = ranked[:3]
-    lines = []
-    header = "Likely pests/diseases (top candidates):\n" if lang == "en" else "ಸರಾಸರಿ ಅನುಮಾನಿತ ರೋಗ/ಕೀಟಗಳು (ಮೇಲವರ್ಗ):\n"
-    lines.append(header)
-    for cand, score, conf, ev in top_k:
-        meta = DISEASE_META.get(cand, {})
-        meta_note = meta.get("note", "")
-        lines.append(f"- {cand.title()} (confidence: {int(conf*100)}%)")
-        if meta_note:
-            lines.append(f"    • {meta_note}")
-        lines.append(f"    • Evidence: {', '.join(ev)}")
-    suggestions = ["Upload photo", "Contact Krishi Adhikari", "View prevention steps"]
-    rec_texts = []
-    for cand, score, conf, ev in top_k:
-        key = cand.lower()
-        if key in PESTICIDE_DB:
-            rec = PESTICIDE_DB[key].get(lang if lang in ["en", "kn"] else "en")
-            if rec:
-                rec_texts.append(f"For {cand.title()}: {rec}")
-    if rec_texts:
-        lines.append("\nSuggested interventions:")
-        for r in rec_texts:
-            lines.append(f"- {r}")
-        suggestions.insert(0, "Pesticide recommendations")
-    lines.append("\nIdentified symptoms:")
-    for s in symptom_keys:
-        lines.append(f"- {s}")
-    final_text = "\n".join(lines)
-    return final_text, False, suggestions
-
-def weather_suggestion_engine(weather, crop_stage=None, language="en"):
-    temp = weather["temp"]
-    humidity = weather["humidity"]
-    wind = weather["wind"]
-    rain = weather["rain"]
-    cond = weather["condition"]
-
-    suggestions = []
-
-    # Temperature Logic
-    if temp > 35:
-        suggestions.append("High heat – give afternoon irrigation and mulch.")
-    elif temp < 15:
-        suggestions.append("Low temperature – avoid fertilizer today.")
-
-    # Rain Logic
-    if rain > 3:
-        suggestions.append("Rainfall occurring – stop irrigation for 24 hours.")
-    else:
-        suggestions.append("No rain – irrigation recommended today.")
-
-    # Humidity Logic
-    if humidity > 80:
-        suggestions.append("High humidity – fungal disease chances are high.")
-    elif humidity < 35:
-        suggestions.append("Low humidity – increase irrigation frequency.")
-
-    # Wind Logic
-    if wind > 20:
-        suggestions.append("High wind – avoid spraying pesticides.")
-
-    # Crop-stage weather fusion
-    if crop_stage:
-        st = crop_stage.lower()
-        if "flower" in st and cond == "Rain":
-            suggestions.append("Rain during flowering – flower drop likely.")
-        if "harvest" in st and rain > 0:
-            suggestions.append("Rain coming – postpone harvest.")
-
-    if language == "kn":
-        suggestions = translate_weather_suggestions_kn(suggestions)
-
-    return suggestions
-
-
-
-# =========================================================
-# NEW MODULE: Weather + crop stage fusion advisory
-# - Combines stage recommendations + upcoming weather to give fused advice (e.g., skip fertilizer if rain predicted)
-# =========================================================
-def weather_crop_fusion(user_id: str, crop: str, stage: str, lang: str):
-    farm = get_user_farm_details(user_id)
-    district = farm.get("district", "unknown")
-
-    weather = fetch_weather_by_location(district)
-    if not weather:
-        return ("Weather data unavailable.", False, ["Retry"])
-
-    # Stage advice
-    stage_advice = stage_recommendation_engine(crop, stage, lang)
-
-    # Weather fusion suggestions
-    fusion = weather_suggestion_engine(weather, crop_stage=stage, language=lang)
-
-    # Build final message
-    if lang == "kn":
-        report = (
-            f"{district} ಹವಾಮಾನ:\n"
-            f"ತಾಪಮಾನ: {weather['temp']}°C | ತೇವಾಂಶ: {weather['humidity']}%\n"
-            f"ಹಂತ: {crop} – {stage}\n\n"
-            f"ಹಂತ ಸಲಹೆ:\n{stage_advice}\n\n"
-            f"ಹವಾಮಾನ ಆಧಾರಿತ ಹೆಚ್ಚುವರಿ ಸಲಹೆಗಳು:\n- " + "\n- ".join(fusion)
-        )
-    else:
-        report = (
-            f"Weather in {district}:\n"
-            f"Temp: {weather['temp']}°C | Humidity: {weather['humidity']}%\n"
-            f"Stage: {crop} – {stage}\n\n"
-            f"Stage Recommendation:\n{stage_advice}\n\n"
-            f"Weather-based Additional Advice:\n- " + "\n- ".join(fusion)
-        )
-
-    return report, False, ["Fertilizer", "Pest Check", "Irrigation"]
-# =========================================================
-# Gemini fallback (crop advisory)
-# =========================================================
-def get_prompt(lang: str) -> str:
-    return f"You are KrishiSakhi. Respond only in {'Kannada' if lang == 'kn' else 'English'} with short actionable crop advice."
-
-
-def crop_advisory(user_id: str, query: str, lang: str, session_key: str):
-    global gemini_client, active_chats
-    try:
-        if not gemini_client:
-            return "AI not configured on server.", False, [], session_key
-        if session_key not in active_chats:
-            if types is None:
-                return "AI configuration incomplete.", False, [], session_key
-            cfg = types.GenerateContentConfig(system_instruction=get_prompt(lang))
-            chat = gemini_client.chats.create(model="gemini-2.0-flash", config=cfg)
-            active_chats[session_key] = chat
-        chat = active_chats[session_key]
-        resp = chat.send_message(query)
-        text = resp.text if hasattr(resp, "text") else str(resp)
-        return text, False, ["Crop stage", "Pest check", "Soil test"], session_key
-
-            
-    except Exception as e:
-        logger.exception("AI error: %s", e)
-        return f"AI error: {e}", False, [], session_key
-        
-
-
-
-
-
-# =========================================================
-# Router — identify intents and call modules
-# =========================================================
-def route(query: str, user_id: str, lang: str, session_key: str):
-    q = query.lower().strip()
-
-    # simple intent checks (order matters)
-    if any(tok in q for tok in ["soil test", "soil testing", "soil centre", "soil center"]):
-        t, v, s = soil_testing_center(user_id, lang)
-        return {"response_text": t, "voice": v, "suggestions": s}
-
-    if any(tok in q for tok in ["timeline", "activity log", "farm activity"]):
-        t, v, s = farm_timeline(user_id, lang)
-        return {"response_text": t, "voice": v, "suggestions": s}
-
-    if any(tok in q for tok in ["weather", "rain", "forecast"]) and "stage" not in q:
-        report, sug, voice = weather_advisory(lang)
-        return {"response_text": report, "voice": voice, "suggestions": sug}
-
-
-    if any(tok in q for tok in ["price", "market", "mandi"]):
-        t, v, s = market_price(query, lang)
-        return {"response_text": t, "voice": v, "suggestions": s}
-
-    if "crop stage" in q or q == "stage" or ("stage" in q and len(q.split()) < 6):
-        t, v, s = get_latest_crop_stage(user_id, lang)
-        return {"response_text": t, "voice": v, "suggestions": s}
-    
-    if any(tok in q for tok in ["pest", "disease", "leaf", "spots", "yellowing", "curl", "blight", "fungus"]):
-        # prefer advanced diagnosis if symptoms present
-        diag_text, voice, sugg = diagnose_advanced(query, user_crop=get_latest_crop_and_stage(user_id)[0], lang=lang)
-        return {"response_text": diag_text, "voice": voice, "suggestions": sugg}
-
-    # fertilizer intent: user can say "fertilizer" or "how much fertilizer"
-    if "fertilizer" in q or "fertiliser" in q or "apply fertilizer" in q:
-        latest_crop, latest_stage = get_latest_crop_and_stage(user_id)
-        if not latest_crop:
-            msg = ("Please provide the crop and stage (e.g., 'fertilizer for paddy tillering')" if lang == "en" else "ದಯವಿಟ್ಟು ಬೆಳೆ ಮತ್ತು ಹಂತವನ್ನು ನೀಡಿ (ಉದಾ: 'fertilizer for paddy tillering')")
-            return {"response_text": msg, "voice": False, "suggestions": ["Provide crop & stage"]}
-        t, v, s = fertilizer_calculator(latest_crop, latest_stage, user_id, lang)
-        return {"response_text": t, "voice": v, "suggestions": s}
-
-    # pesticide intent: user asks "what to spray for aphid" or "pesticide for fruit borer"
-    if "pesticide" in q or "spray" in q or "aphid" in q or "fruit borer" in q:
-        # try to extract pest name (simple)
-        pest = None
-        for key in PESTICIDE_DB.keys():
-            if key in q:
-                pest = key
-                break
-        if not pest:
-            # fallback ask
-            msg = ("Please tell me the pest name or upload a photo (e.g., 'aphid')." if lang == "en"
-                   else "ದಯವಿಟ್ಟು ಕೀಟದ ಹೆಸರು ಅಥವಾ ಫೋಟೋ ನೀಡಿ (ಉದಾ: aphid).")
-            return {"response_text": msg, "voice": False, "suggestions": ["Upload photo", "aphid"]}
-        t, v, s = pesticide_recommendation("", pest, lang)
-        return {"response_text": t, "voice": v, "suggestions": s}
-
-    # irrigation intent
-    if "irrigation" in q or "water" in q or "irrigate" in q:
-        # try latest crop & stage
-        logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
-        latest_crop = None; latest_stage = None; latest_ts = -1
-        for crop, entries in logs.items() if isinstance(logs, dict) else []:
-            if isinstance(entries, dict):
-                for aid, data in entries.items():
-                    ts = data.get("timestamp", 0)
-                    if ts and ts > latest_ts:
-                        latest_ts = ts
-                        latest_crop = data.get("cropName", crop)
-                        latest_stage = data.get("stage", "")
-        if not latest_crop:
-            msg = ("Provide crop & stage for irrigation advice." if lang == "en" else "ನೀರಾವರಿ ಸಲಹೆಗೆ ಬೆಳೆ ಮತ್ತು ಹಂತ ನೀಡಿ.")
-            return {"response_text": msg, "voice": False, "suggestions": ["Provide crop & stage"]}
-        t, v, s = irrigation_schedule(latest_crop, latest_stage, user_id, lang)
-        return {"response_text": t, "voice": v, "suggestions": s}
-
-    # yield prediction intent
-    if "yield" in q or "estimate" in q or "production" in q:
-        # try to extract crop name; fallback to latest crop
-        crop = None
-        for c in BASE_YIELD_TON_PER_HA.keys():
-            if c in q:
-                crop = c
-                break
-        if not crop:
-            logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
-            latest_crop = None; latest_ts = -1
-            for crop_k, entries in logs.items() if isinstance(logs, dict) else []:
-                if isinstance(entries, dict):
-                    for aid, data in entries.items():
-                        ts = data.get("timestamp", 0)
-                        if ts and ts > latest_ts:
-                            latest_ts = ts
-                            latest_crop = data.get("cropName", crop_k)
-            crop = latest_crop or list(BASE_YIELD_TON_PER_HA.keys())[0]
-        t, v, s = yield_prediction(crop, user_id, lang)
-        return {"response_text": t, "voice": v, "suggestions": s}
-
-    # weather + crop stage fusion intent
-    if "weather" in q and "stage" in q:
-        latest_crop, latest_stage = get_latest_crop_and_stage(user_id)
-        if not latest_crop:
-            return {"response_text": "No crop found. Add crop activity.", "voice": False, "suggestions": ["Add activity"]}
-        text, v, s = weather_crop_fusion(user_id, latest_crop, latest_stage, lang)
-        return {"response_text": text, "voice": v, "suggestions": s}
-        
-    # ----------------------------------------------------------------------
-    # WEATHER-BASED DISEASE PREDICTION
-    # ----------------------------------------------------------------------
-    if "disease" in q and "weather" in q:
-        latest_crop, _ = get_latest_crop_and_stage(user_id)
-        if not latest_crop:
-            return {"response_text": "No crop found. Add farm activity.", "voice": False, "suggestions": ["Add activity"]}
-        farm = get_user_farm_details(user_id)
-        weather = fetch_weather_by_location(farm.get("district", "unknown"))
-        if not weather:
-            return {"response_text": "Weather unavailable.", "voice": False, "suggestions": ["Retry"]}
-        result = predict_disease_from_weather(latest_crop, weather, lang)
-        return {"response_text": result, "voice": False, "suggestions": ["Pest check", "Preventive spray"]}
-
-    # ----------------------------------------------------------------------
-    # ADVANCED PEST/DISEASE DIAGNOSIS (SYMPTOM BASED)
-    # ----------------------------------------------------------------------
-    if any(tok in q for tok in ["pest", "disease", "symptom", "leaf", "spots", "yellowing", "curl", "blight", "fungus"]):
-        logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
-        latest_crop = None
-        latest_ts = -1
-
-        for crop_k, entries in logs.items() if isinstance(logs, dict) else []:
-            if isinstance(entries, dict):
-                for aid, data in entries.items():
-                    ts = data.get("timestamp", 0)
-                    if ts > latest_ts:
-                        latest_ts = ts
-                        latest_crop = data.get("cropName", crop_k)
-
-        diag_text, voice, sugg = diagnose_advanced(query, user_crop=latest_crop, lang=lang)
-        return {
-            "response_text": diag_text,
-            "voice": voice,
-            "suggestions": sugg
-        }
-
-    # General agriculture knowledge intent
-    gen_text, gen_voice, gen_sugg = general_agri_knowledge_engine(query, lang)
-    if gen_text:
-        return {"response_text": gen_text, "voice": gen_voice, "suggestions": gen_sugg}
-
-
-    # Default → Gemini crop advisory or fallback text
-    t, v, s, sid = crop_advisory(user_id, query, lang, session_key)
-    return {"response_text": t, "voice": v, "suggestions": s, "session_id": sid}
-
 # =========================================================
 # GENERAL AGRICULTURE KNOWLEDGE ENGINE
 # =========================================================
@@ -2762,7 +1950,1462 @@ GENERAL_AGRI_TOPICS = {
     }
 }
 
+PRICE_LIST = {
+    "paddy": 20,
+    "chilli": 50,
+    "ragi": 18,
+    "arecanut": 470,
+    "banana": 12,
+    "turmeric": 120,
+    "cotton": 40,
+    "sugarcane": 3,      # per kg equivalent (₹3000/ton)
 
+    # Cereals & Millets
+    "maize": 18,
+    "jowar": 25,
+    "bajra": 22,
+    "wheat": 24,
+    "foxtail millet": 42,
+    "little millet": 55,
+
+    # Pulses
+    "red gram": 110,
+    "green gram": 95,
+    "black gram": 80,
+    "horse gram": 55,
+    "cowpea": 60,
+
+    # Oilseeds
+    "groundnut": 55,
+    "sunflower": 45,
+    "soybean": 40,
+    "sesame": 120,
+    "castor": 50,
+
+    # Fruits
+    "mango": 25,
+    "papaya": 10,
+    "grapes": 35,
+    "pomegranate": 90,
+    "sapota": 20,
+
+    # Vegetables
+    "tomato": 12,
+    "potato": 20,
+    "onion": 18
+}
+# ===============================================================
+# DISTRICT → LAT/LON MAPPING (Karnataka major districts)
+# ===============================================================
+DISTRICT_COORDS = {
+    "uttara kannada": (14.8, 74.1),
+    "udupi": (13.34, 74.74),
+    "dakshina kannada": (12.87, 74.88),
+    "shivamogga": (13.93, 75.56),
+    "hassan": (13.01, 76.10),
+    "kodagu": (12.34, 75.80),
+    "mandya": (12.52, 76.90),
+    "mysuru": (12.30, 76.65),
+    "chamarajanagar": (11.93, 76.95),
+    "bengaluru": (12.97, 77.59),
+    "bengaluru rural": (13.19, 77.49),
+    "ramanagara": (12.72, 77.27),
+    "tumakuru": (13.34, 77.10),
+    "chikkaballapur": (13.44, 77.72),
+    "kolar": (13.13, 78.13),
+    "chitradurga": (14.23, 76.40),
+    "davangere": (14.47, 75.92),
+    "ballari": (15.14, 76.92),
+    "raichur": (16.21, 77.34),
+    "koppal": (15.35, 76.15),
+    "gadag": (15.43, 75.63),
+    "haveri": (14.79, 75.40),
+    "dharwad": (15.46, 75.01),
+    "bidar": (17.91, 77.53),
+    "kalaburagi": (17.33, 76.83),
+    "yadgir": (16.75, 77.14),
+    "belagavi": (15.85, 74.50),
+    "vijayapura": (16.83, 75.71),
+    "bagalkot": (16.18, 75.70)
+}
+
+
+# ---------------- helper text normalization & symptom matcher ----------------
+def _normalize_text(text: str) -> str:
+    text = text.lower().strip()
+    text = re.sub(r"[^a-z0-9\s/-]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+def _tokenize(text: str):
+    return text.split()
+
+# match symptom phrases (exact, synonym, fuzzy)
+def _extract_symptom_keys(user_text: str, fuzzy_threshold: float = 0.6):
+    """
+    Returns list of matched canonical symptom keys (may contain duplicates).
+    Uses:
+      - exact substring match against synonyms and canonical keys
+      - fuzzy matching via difflib for partial matches
+    """
+    text = _normalize_text(user_text)
+    found = []
+
+    # check synonyms first (longest match priority)
+    for phrase, canonical in sorted(SYMPTOM_SYNONYMS.items(), key=lambda x: -len(x[0])):
+        if phrase in text:
+            found.append(canonical)
+
+    # check canonical keys exact substring
+    for key in SYMPTOM_DB.keys():
+        if key in text:
+            found.append(key)
+
+    # fuzzy match short phrases -> to capture variants
+    tokens = _tokenize(text)
+    joined = " ".join(tokens)
+    for key in SYMPTOM_DB.keys():
+        ratio = difflib.SequenceMatcher(None, joined, key).ratio()
+        if ratio >= fuzzy_threshold:
+            found.append(key)
+
+    # additional n-gram matching: 2-4 gram window
+    n = len(tokens)
+    for L in range(2, min(6, n+1)):
+        for i in range(n - L + 1):
+            gram = " ".join(tokens[i:i+L])
+            for phrase, canonical in SYMPTOM_SYNONYMS.items():
+                if gram == phrase:
+                    found.append(canonical)
+
+    return list(found)
+
+def _score_candidates(symptom_keys: list, crop: Optional[str] = None):
+    scores = defaultdict(float)
+    evidence = defaultdict(list)
+    for sk in symptom_keys:
+        mapped = SYMPTOM_DB.get(sk, [])
+        for cand in mapped:
+            base_weight = 1.0 + (0.25 if len(sk.split()) >= 2 else 0)
+            scores[cand] += base_weight
+            evidence[cand].append(f"symptom:{sk}")
+    if crop:
+        crop_l = crop.lower()
+        crop_map = CROP_SYMPTOM_WEIGHT.get(crop_l, {})
+        for cand, boost in crop_map.items():
+            scores[cand] += boost
+            evidence[cand].append(f"crop_boost:{crop_l}")
+    if not scores:
+        return []
+    total = sum(scores.values())
+    ranked = []
+    for cand, sc in sorted(scores.items(), key=lambda x: -x[1]):
+        confidence = round(min(0.99, sc / (total + 1e-6)), 2)
+        ranked.append((cand, round(sc, 2), confidence, evidence.get(cand, [])))
+    return ranked
+
+# ===============================================================
+# GET USER FARM DETAILS (Helper)
+# ===============================================================
+def get_user_farm_details(user_id: str):
+    data = firebase_get(f"Users/{user_id}/farmDetails")
+    if isinstance(data, dict):
+        return data
+    return {}
+
+# =========================================================
+# Domain functions (fertilizer calculator, pesticide, irrigation, yield, weather/advisory, diagnosis)
+# =========================================================
+# ===============================================================
+# CROP STAGE ADVISORY ENGINE
+# ===============================================================
+def stage_recommendation_engine(crop: str, stage: str, lang: str):
+    crop_l = crop.lower()
+    stage_l = stage.lower()
+
+    if crop_l in STAGE_RECOMMENDATIONS:
+        for s, msg in STAGE_RECOMMENDATIONS[crop_l].items():
+            if stage_l in s:
+                return msg["kn"] if lang == "kn" else msg["en"]
+
+    # Fallback Answer
+    return ("No specific stage advisory available." if lang == "en"
+            else "ಈ ಹಂತಕ್ಕೆ ವಿಶೇಷ ಸಲಹೆ ಲಭ್ಯವಿಲ್ಲ.")
+
+# ===============================================================
+# FERTILIZER CALCULATOR (Stage-wise N-P-K)
+# ===============================================================
+def fertilizer_calculator(crop: str, stage: str, lang: str):
+    crop_l = crop.lower()
+    stage_l = stage.lower()
+
+    if crop_l in FERTILIZER_BASE:
+        for st, (N, P, K) in FERTILIZER_BASE[crop_l].items():
+            if stage_l in st:
+                if lang == "kn":
+                    return f"{crop} - {stage} ಹಂತ:\nN: {N}kg | P: {P}kg | K: {K}kg"
+                return f"{crop} - {stage} stage:\nN: {N}kg | P: {P}kg | K: {K}kg"
+
+    return ("Fertilizer data not available." if lang == "en"
+            else "ರಸಗೊಬ್ಬರ ಮಾಹಿತಿ ಲಭ್ಯವಿಲ್ಲ.")
+# ===============================================================
+# IRRIGATION SCHEDULE ENGINE
+# ===============================================================
+def irrigation_engine(crop: str, user_id: str, lang: str):
+    crop_l = crop.lower()
+    farm = get_user_farm_details(user_id)
+    district = farm.get("district", "unknown")
+
+    weather = fetch_weather_by_location(district)
+    if not weather:
+        weather = get_mock_weather_for_district(district)
+
+    et = CROP_ET_BASE.get(crop_l, 4)
+
+    # irrigation mm/day
+    irrigation_mm = et - (weather["rain"] * 0.8)
+    irrigation_mm = max(0, irrigation_mm)
+
+    if lang == "kn":
+        return (
+            f"{crop} ನೀರಾವರಿ ಸಲಹೆ:\n"
+            f"ET: {et} mm/day\n"
+            f"ಮಳೆ: {weather['rain']} mm\n"
+            f"ಇಂದು ಅಗತ್ಯ ನೀರಾವರಿ: {irrigation_mm:.1f} mm"
+        )
+    return (
+        f"{crop} irrigation recommendation:\n"
+        f"ET: {et} mm/day\n"
+        f"Rain: {weather['rain']} mm\n"
+        f"Required irrigation today: {irrigation_mm:.1f} mm"
+    )
+# ===============================================================
+# MARKET PRICE ENGINE (30 crop support)
+# ===============================================================
+def market_price_engine(query: str, lang: str):
+    q = query.lower()
+    for crop, price in PRICE_LIST.items():
+        if crop in q:
+            if lang == "kn":
+                return f"{crop} ಸರಾಸರಿ ಬೆಲೆ: ₹{price}/kg"
+            return f"Average price of {crop}: ₹{price}/kg"
+
+    if lang == "kn":
+        return "ದಯವಿಟ್ಟು ಬೆಳೆ ಹೆಸರು ನೀಡಿ."
+    return "Please specify the crop name."
+# ===============================================================
+# YIELD PREDICTION ENGINE
+# ===============================================================
+def yield_prediction_engine(crop: str, area_acres: float, lang: str):
+    crop_l = crop.lower()
+
+    if crop_l not in BASE_YIELD_TON_PER_HA:
+        return ("Yield data not available." if lang == "en"
+                else "ಉತ್ಪಾದನಾ ಮಾಹಿತಿ ಲಭ್ಯವಿಲ್ಲ.")
+
+    base_yield = BASE_YIELD_TON_PER_HA[crop_l]  # ton/ha
+
+    # Convert acres → hectare
+    area_ha = area_acres * 0.404
+
+    predicted = base_yield * area_ha
+
+    if lang == "kn":
+        return f"ಅಂದಾಜು ಉತ್ಪಾದನೆ: {predicted:.2f} ಟನ್ (ಪ್ರದೇಶ: {area_acres} ಎಕರೆ)"
+
+    return f"Estimated yield: {predicted:.2f} tons (Area: {area_acres} acres)"
+# ===============================================================
+# WEATHER DISEASE PREDICTION ENGINE
+# ===============================================================
+def disease_prediction_engine(crop: str, user_id: str, lang: str):
+    farm = get_user_farm_details(user_id)
+    district = farm.get("district", "unknown")
+    crop_l = crop.lower()
+
+    weather = fetch_weather_by_location(district)
+    if not weather:
+        return ("Weather data unavailable." if lang == "en"
+                else "ಹವಾಮಾನ ಮಾಹಿತಿ ಲಭ್ಯವಿಲ್ಲ.")
+
+    temp = weather["temp"]
+    humidity = weather["humidity"]
+    rain = weather["rain"]
+
+    conditions = []
+    if humidity > 80:
+        conditions.append("high_humidity")
+    if rain > 5:
+        conditions.append("continuous_rain")
+    if temp > 32 and humidity < 40:
+        conditions.append("high_temp_low_humidity")
+
+    risks = []
+    for rule in DISEASE_WEATHER_RISK.get(crop_l, []):
+        if rule["cond"] in conditions:
+            risks.append(rule["disease"])
+
+    if not risks:
+        return ("No major disease risks detected." if lang == "en"
+                else "ಪ್ರಮುಖ ರೋಗದ ಅಪಾಯ ಕಂಡುಬರಲಿಲ್ಲ.")
+
+    if lang == "kn":
+        return "ಸಾಧ್ಯವಾದ ರೋಗಗಳು:\n" + "\n".join(risks)
+
+    return "Possible diseases:\n" + "\n".join(risks)
+# ===============================================================
+# ADVANCED PEST DIAGNOSIS ENGINE
+# ===============================================================
+def diagnose_pest(user_text: str, language: str):
+    symptom_keys = match_symptoms(user_text)
+
+    if not symptom_keys:
+        fallback = {
+            "en": "I could not identify the pest. Please describe more symptoms or upload a photo.",
+            "kn": "ಕೀಟ ಗುರುತಿಸಲು ಸಾಧ್ಯವಾಗಲಿಲ್ಲ. ದಯವಿಟ್ಟು ಹೆಚ್ಚಿನ ಲಕ್ಷಣ ವಿವರ ನೀಡಿ ಅಥವಾ ಫೋಟೋ ಕಳುಹಿಸಿ."
+        }
+        return fallback[language], ["Upload photo"]
+
+    ranked = _score_candidates(symptom_keys)
+
+    if not ranked:
+        return fallback[language], ["Upload photo"]
+
+    top_pest = ranked[0][0]
+
+    # Now call pesticide recommendation
+    pesticide_info = pesticide_recommendation_engine(top_pest, language)
+
+    response = (
+        f"Detected pest: {top_pest}\n\n"
+        f"{pesticide_info}"
+    )
+
+    return response, ["More pest info", "Upload photo"]
+
+# ===============================================================
+# WEATHER ADVISORY ENGINE (Detailed)
+# ===============================================================
+def weather_advisory_engine(user_id: str, lang: str):
+    farm = get_user_farm_details(user_id)
+    district = farm.get("district", "unknown")
+
+    weather = fetch_weather_by_location(district)
+
+    if not weather:
+        msg = {
+            "en": "Weather information unavailable.",
+            "kn": "ಹವಾಮಾನ ಮಾಹಿತಿ ಲಭ್ಯವಿಲ್ಲ."
+        }
+        return msg[lang], [], False
+
+    # Basic suggestions (rain, heat, humidity, wind)
+    suggestions = weather_suggestion_engine(weather, None, lang)
+
+    # Add WEATHER CLASSIFICATION ENGINE output
+    classified_conditions = classify_weather_condition(weather, lang)
+
+    # Merge unique suggestions + conditions
+    final_suggestions = list(dict.fromkeys(suggestions + classified_conditions))
+
+    if lang == "kn":
+        report = (
+            f"🌤️ {district} ಹವಾಮಾನ ವರದಿ:\n"
+            f"🌡️ ತಾಪಮಾನ: {weather['temp']}°C\n"
+            f"💧 ತೇವಾಂಶ: {weather['humidity']}%\n"
+            f"🌬️ ಗಾಳಿ: {weather['wind']} km/h\n"
+            f"🌧️ ಮಳೆ: {weather['rain']} mm\n\n"
+            f"➡️ ಹವಾಮಾನ ಆಧಾರಿತ ಸಲಹೆಗಳು ಕೆಳಗಿವೆ:"
+        )
+    else:
+        report = (
+            f"🌤️ Weather Report for {district}:\n"
+            f"🌡️ Temperature: {weather['temp']}°C\n"
+            f"💧 Humidity: {weather['humidity']}%\n"
+            f"🌬️ Wind: {weather['wind']} km/h\n"
+            f"🌧️ Rain: {weather['rain']} mm\n\n"
+            f"➡️ Weather-based recommendations:"
+        )
+
+    return report, final_suggestions, True
+
+# ===============================================================
+# GENERAL AGRICULTURE KNOWLEDGE ENGINE
+# ===============================================================
+def general_agri_knowledge_engine(query: str, lang: str):
+    q = query.lower()
+
+    for topic, info in GENERAL_AGRI_TOPICS.items():
+        if topic in q:
+            return info[lang], False, ["More details", "Best Practices"]
+
+    generic_keywords = [
+        "what is", "how to", "benefit", "fertility", "compost", "soil health",
+        "organic", "mulching", "irrigation", "farming"
+    ]
+
+    if any(k in q for k in generic_keywords):
+        if lang == "kn":
+            return (
+                "ಸಾಮಾನ್ಯ ಕೃಷಿ ಪ್ರಶ್ನೆ ಪತ್ತೆಯಾಗಿದೆ. ಮಣ್ಣಿನ ಆರೋಗ್ಯ, ನೀರಾವರಿ, ಜೈವ ಗೊಬ್ಬರ, ಮಲ್ಚಿಂಗ್, ಕೀಟನಿಯಂತ್ರಣ ಮೊದಲಾದವುಗಳ ಬಗ್ಗೆ ಕೇಳಬಹುದು.",
+                False,
+                ["Organic farming", "Mulching", "Irrigation"]
+            )
+        return (
+            "General agriculture query detected. Ask about soil health, irrigation, compost, fertilizers, pests, etc.",
+            False,
+            ["Organic farming", "Soil health", "Irrigation"]
+        )
+
+    return None, None, None
+# ===============================================================
+# PESTICIDE RECOMMENDATION ENGINE (Advanced)
+# ===============================================================
+def pesticide_recommendation_engine(pest: str, lang: str):
+    pest_l = pest.lower()
+
+    if pest_l not in PESTICIDE_DB:
+        if lang == "kn":
+            return "ಈ ಕೀಟಕ್ಕೆ ಶಿಫಾರಸು ಲಭ್ಯವಿಲ್ಲ. ದಯವಿಟ್ಟು ಮತ್ತಷ್ಟು ವಿವರ ನೀಡಿ."
+        return "No pesticide recommendations found for this pest."
+
+    data = PESTICIDE_DB[pest_l]
+
+    if lang == "kn":
+        return (
+            f"ಜೈವ ನಿಯಂತ್ರಣ:\n{data['organic']['kn']}\n\n"
+            f"ರಾಸಾಯನಿಕ ನಿಯಂತ್ರಣ:\n{data['chemical']['kn']}\n\n"
+            "⚠ ಸುರಕ್ಷತಾ ಸೂಚನೆ: 5–7 ದಿನಗಳ ನಂತರ ಮಾತ್ರ ಕೊಯ್ಲು ಮಾಡಿ."
+        )
+
+    return (
+        f"Organic control:\n{data['organic']['en']}\n\n"
+        f"Chemical control:\n{data['chemical']['en']}\n\n"
+        "⚠ Safety Note: Maintain 5–7 days PHI before harvest."
+    )
+import requests
+
+# ===============================================================
+# FETCH WEATHER BY LOCATION (Free API — No Key Needed)
+# ===============================================================
+def fetch_weather_by_location(district: str):
+    try:
+        district_l = district.lower().strip()
+
+        if district_l not in DISTRICT_COORDS:
+            print("Unknown district:", district)
+            return None
+
+        lat, lon = DISTRICT_COORDS[district_l]
+
+        url = (
+            f"https://api.open-meteo.com/v1/forecast?"
+            f"latitude={lat}&longitude={lon}"
+            f"&current_weather=true"
+            f"&hourly=relativehumidity_2m,precipitation"
+        )
+
+        res = requests.get(url, timeout=8)
+        data = res.json()
+
+        if "current_weather" not in data:
+            return None
+
+        current = data["current_weather"]
+
+        # Hourly rain & humidity fallback
+        hourly = data.get("hourly", {})
+
+        humidity = hourly.get("relativehumidity_2m", [60])[0]
+        rain = hourly.get("precipitation", [0])[0]
+
+        weather_info = {
+            "temp": current.get("temperature", 28),
+            "wind": current.get("windspeed", 5),
+            "humidity": humidity,
+            "rain": rain,
+            "condition": current.get("weathercode", "Clear"),
+            "description": _weather_code_to_text(current.get("weathercode", 0))
+        }
+
+        return weather_info
+
+    except Exception as e:
+        print("Weather fetch error:", e)
+        return None
+def _weather_code_to_text(code):
+    mapping = {
+        0: "Clear",
+        1: "Mainly clear",
+        2: "Partly cloudy",
+        3: "Cloudy",
+        45: "Fog",
+        48: "Depositing rime fog",
+        51: "Light drizzle",
+        61: "Light rain",
+        63: "Moderate rain",
+        65: "Heavy rain",
+        71: "Snowfall",
+        80: "Rain showers",
+        95: "Thunderstorm"
+    }
+    return mapping.get(code, "Weather unknown")
+# ===============================================================
+# WEATHER CONDITION CLASSIFICATION ENGINE
+# ===============================================================
+def classify_weather_condition(weather: dict, lang: str):
+    """
+    Classifies weather into meaningful agricultural categories.
+    Input weather dict must contain:
+        temp, humidity, wind, rain, condition (optional)
+    """
+
+    temp = weather.get("temp", 30)
+    humidity = weather.get("humidity", 60)
+    wind = weather.get("wind", 5)
+    rain = weather.get("rain", 0)
+    cond = weather.get("condition", "").lower()
+
+    categories = []
+
+    # Temperature classification
+    if temp >= 38:
+        categories.append("extreme_heat")
+    elif temp >= 32:
+        categories.append("high_heat")
+    elif temp <= 12:
+        categories.append("cold_stress")
+
+    # Humidity classification
+    if humidity >= 85:
+        categories.append("very_high_humidity")
+    elif humidity >= 70:
+        categories.append("high_humidity")
+    elif humidity <= 30:
+        categories.append("low_humidity")
+
+    # Rain classification
+    if rain >= 20:
+        categories.append("heavy_rain")
+    elif rain >= 5:
+        categories.append("rainy")
+    elif rain == 0:
+        categories.append("dry")
+
+    # Wind classification
+    if wind >= 30:
+        categories.append("storm_warning")
+    elif wind >= 15:
+        categories.append("wind_stress")
+
+    # If nothing major → ideal weather
+    if not categories:
+        categories.append("ideal")
+
+    # Language-specific descriptions
+    messages_en = {
+        "extreme_heat": "Extreme heat – risk of crop dehydration.",
+        "high_heat": "High heat – increase irrigation frequency.",
+        "cold_stress": "Cold stress – avoid fertilizer application.",
+        "very_high_humidity": "Very high humidity – high fungal disease risk.",
+        "high_humidity": "High humidity – increased fungal infection chance.",
+        "low_humidity": "Low humidity – soil moisture loss likely.",
+        "heavy_rain": "Heavy rainfall – avoid irrigation and spraying.",
+        "rainy": "Rainy conditions – reduce irrigation.",
+        "dry": "Dry weather – irrigation recommended.",
+        "storm_warning": "Strong winds/storm – avoid spraying pesticides.",
+        "wind_stress": "High wind – may cause lodging in crops.",
+        "ideal": "Weather is ideal for farming operations."
+    }
+
+    messages_kn = {
+        "extreme_heat": "ತೀವ್ರ ಬಿಸಿಲು – ಬೆಳೆ ಒಣಗುವ ಅಪಾಯ.",
+        "high_heat": "ಹೆಚ್ಚು ಬಿಸಿಲು – ನೀರಾವರಿ ಪ್ರಮಾಣ ಹೆಚ್ಚಿಸಿ.",
+        "cold_stress": "ತೀವ್ರ ಚಳಿ – ರಸಗೊಬ್ಬರ ಬಳಕೆ ತಪ್ಪಿಸಿ.",
+        "very_high_humidity": "ಅತ್ಯಧಿಕ ತೇವಾಂಶ – ಫಂಗಸ್ ರೋಗದ ಅಪಾಯ ಹೆಚ್ಚು.",
+        "high_humidity": "ಹೆಚ್ಚು ತೇವಾಂಶ – ಫಂಗಲ್ ಸೋಂಕಿನ ಸಾಧ್ಯತೆ.",
+        "low_humidity": "ಕಡಿಮೆ ತೇವಾಂಶ – ಮಣ್ಣಿನ ತೇವಾಂಶ ಕಡಿಮೆಯಾಗಬಹುದು.",
+        "heavy_rain": "ಭಾರೀ ಮಳೆ – ನೀರಾವರಿ ಮತ್ತು ಸಿಂಪಡಣೆ ತಪ್ಪಿಸಿ.",
+        "rainy": "ಮಳೆಯ ಹವಾಮಾನ – ನೀರಾವರಿ ಕಡಿಮೆ ಮಾಡಿ.",
+        "dry": "ಒಣ ಹವಾಮಾನ – ನೀರಾವರಿ ಅಗತ್ಯ.",
+        "storm_warning": "ಬಲವಾದ ಗಾಳಿ/ಪ್ರಳಯ – ಕೀಟನಾಶಕ ಸಿಂಪಡಣೆ ಬೇಡ.",
+        "wind_stress": "ಬಲವಾದ ಗಾಳಿ – ಬೆಳೆ ಬೀಳುವ ಅಪಾಯ.",
+        "ideal": "ಕೃಷಿಗೆ ಅನುಕೂಲಕರ ಹವಾಮಾನ."
+    }
+
+    translated = []
+    for c in categories:
+        translated.append(messages_kn[c] if lang == "kn" else messages_en[c])
+
+    return translated
+   
+# ===============================================================
+# ADVANCED DISEASE PREDICTION FROM WEATHER + CROP
+# ===============================================================
+
+def predict_disease_from_weather(user_id: str, crop: str, lang: str):
+    crop_l = crop.lower()
+
+    # Fetch farm location
+    farm = get_user_farm_details(user_id)
+    district = farm.get("district", None)
+
+    if not district:
+        msg = {
+            "en": "Farm district not found. Update farm details.",
+            "kn": "ಫಾರಂ ಜಿಲ್ಲೆಯ ಮಾಹಿತಿ ಲಭ್ಯವಿಲ್ಲ. farmDetails ನವೀಕರಿಸಿ."
+        }
+        return msg[lang], False, ["Update farm details"]
+
+    # Fetch weather
+    weather = fetch_weather_by_location(district)
+    if not weather:
+        return (
+            "Weather information unavailable." if lang == "en"
+            else "ಹವಾಮಾನ ಮಾಹಿತಿ ಲಭ್ಯವಿಲ್ಲ.",
+            False,
+            ["Retry"]
+        )
+
+    temp = weather["temp"]
+    humidity = weather["humidity"]
+    rain = weather["rain"]
+    wind = weather["wind"]
+    cond = weather["condition"].lower()
+
+    # Determine conditions
+    detected_conditions = []
+
+    if humidity > 80:
+        detected_conditions.append("high_humidity")
+
+    if rain > 10 or "heavy" in cond:
+        detected_conditions.append("heavy_rain")
+
+    if rain > 5:
+        detected_conditions.append("continuous_rain")
+
+    if temp > 32 and humidity < 40:
+        detected_conditions.append("high_temp_low_humidity")
+
+    if temp > 35:
+        detected_conditions.append("high_temp")
+
+    if "rain" in cond:
+        detected_conditions.append("rainy")
+
+    # Match diseases for this crop
+    diseases = []
+    for rule in DISEASE_WEATHER_RISK.get(crop_l, []):
+        if rule["cond"] in detected_conditions:
+            diseases.append(rule["disease"])
+
+    # If no disease appears
+    if not diseases:
+        msg = {
+            "en": f"No major disease risk detected for {crop}.",
+            "kn": f"{crop} ಗಾಗಿ ಪ್ರಮುಖ ರೋಗದ ಅಪಾಯ ಕಂಡುಬರಲಿಲ್ಲ."
+        }
+        return msg[lang], False, ["Check pest symptoms", "View crop advisory"]
+
+    # Build detailed report
+    if lang == "kn":
+        report = (
+            f"{district} ಹವಾಮಾನ ಆಧರಿಸಿ {crop} ಬೆಳೆಗಾಗುವ ಸಾಧ್ಯ ರೋಗಗಳು:\n\n"
+            f" ತಾಪಮಾನ: {temp}°C\n"
+            f" ತೇವಾಂಶ: {humidity}%\n"
+            f" ಮಳೆ: {rain} mm\n"
+            f" ಗಾಳಿ: {wind} km/h\n\n"
+            "⚠ ಸಾಧ್ಯವಾದ ರೋಗಗಳು:\n - " + "\n - ".join(diseases)
+        )
+    else:
+        report = (
+            f"Based on weather in {district}, the following diseases are likely for {crop}:\n\n"
+            f" Temperature: {temp}°C\n"
+            f" Humidity: {humidity}%\n"
+            f" Rain: {rain} mm\n"
+            f" Wind: {wind} km/h\n\n"
+            "⚠ Possible Diseases:\n - " + "\n - ".join(diseases)
+        )
+
+    return report, True, ["Pest Check", "Fungicide Advice", "Crop Stage"]
+# =====================================================================
+# ADVANCED SYMPTOM DIAGNOSIS – Natural Language Pest/Disease Detection
+# =====================================================================
+# ------------------------------------------------------
+# EXTRACT SYMPTOM KEYS FROM NATURAL LANGUAGE
+# ------------------------------------------------------
+def _extract_symptom_keys(text: str):
+    text_l = text.lower()
+    keys = []
+
+    for symptom in SYMPTOM_DB.keys():
+        # direct match
+        if symptom in text_l:
+            keys.append(symptom)
+            continue
+
+        # fuzzy match (for spelling mistakes)
+        match = difflib.get_close_matches(symptom, [text_l], n=1, cutoff=0.6)
+        if match:
+            keys.append(symptom)
+
+    return list(set(keys))
+# ------------------------------------------------------
+# SCORE POSSIBLE PEST/DISEASE CANDIDATES
+# ------------------------------------------------------
+def _score_candidates(symptom_keys: list, crop: str = None):
+    scores = defaultdict(float)
+    evidence = defaultdict(list)
+
+    for sk in symptom_keys:
+        candidates = SYMPTOM_DB.get(sk, [])
+        for cand in candidates:
+            scores[cand] += 1.0
+            evidence[cand].append(f"matched symptom: {sk}")
+
+    # Boost based on crop
+    if crop:
+        crop_l = crop.lower()
+        if crop_l in CROP_SYMPTOM_WEIGHT:
+            for cand, boost in CROP_SYMPTOM_WEIGHT[crop_l].items():
+                scores[cand] += boost
+                evidence[cand].append(f"crop relevance boost: {crop_l}")
+
+    # Convert to list
+    ranked = sorted(scores.items(), key=lambda x: -x[1])
+
+    results = []
+    total = sum(scores.values()) if scores else 1
+
+    for cand, sc in ranked:
+        confidence = min(0.99, sc / (total + 1e-6))
+        results.append({
+            "condition": cand,
+            "score": round(sc, 2),
+            "confidence": round(confidence * 100, 1),
+            "evidence": evidence[cand]
+        })
+
+    return results
+# ------------------------------------------------------
+# ADVANCED DIAGNOSIS MAIN FUNCTION
+# ------------------------------------------------------
+def diagnose_advanced_symptoms(user_text: str, crop: str, lang: str):
+    symptom_keys = _extract_symptom_keys(user_text)
+
+    if not symptom_keys:
+        if lang == "kn":
+            return (
+                "ಲಕ್ಷಣಗಳಿಂದ ರೋಗ ಅಥವಾ ಕೀಟವನ್ನು ಗುರುತಿಸಲು ಸಾಧ್ಯವಾಗಿಲ್ಲ. ದಯವಿಟ್ಟು ಹೆಚ್ಚಿನ ವಿವರ ನೀಡಿ ಅಥವಾ ಫೋಟೋ ಅಪ್ಲೋಡ್ ಮಾಡಿ.",
+                ["Upload photo", "Common pest symptoms"]
+            )
+        return (
+            "Unable to identify disease/pest from symptoms. Please provide more details or upload a photo.",
+            ["Upload photo", "Common pest symptoms"]
+        )
+
+    ranked = _score_candidates(symptom_keys, crop)
+
+    # Choose top 1–3 conditions
+    top = ranked[:3]
+
+    if lang == "kn":
+        msg = "ಲಕ್ಷಣಗಳ ಆಧಾರದ ಮೇಲೆ ಸಾಧ್ಯವಾದ ಸಮಸ್ಯೆಗಳು:\n"
+        for r in top:
+            msg += f"- {r['condition']} (ನಂಬಿಕೆ {r['confidence']}%)\n"
+    else:
+        msg = "Possible issues based on symptoms:\n"
+        for r in top:
+            msg += f"- {r['condition']} ({r['confidence']}% confidence)\n"
+
+    suggestions = ["Pesticide recommendation", "Prevention tips", "Stage-wise advice"]
+
+    return msg, suggestions
+
+
+
+
+
+
+# =========================================================
+# HF-backed crop advisory function (replaces Gemini)
+# =========================================================
+def get_prompt(lang: str) -> str:
+    return f"You are KrishiSakhi. Respond concisely in {'Kannada' if lang == 'kn' else 'English'} with short actionable crop advice. Keep replies short and actionable."
+
+def crop_advisory(user_id: str, query: str, lang: str, session_key: str):
+    """
+    Uses HF inference to generate crop-specific responses.
+    Falls back to a helpful message if HF is not available.
+    """
+    try:
+        # Compose context: include user's latest farm details if available (to improve generation)
+        farm = get_user_farm_details(user_id) or {}
+        farm_summary = ""
+        if farm:
+            parts = []
+            for k in ("district", "soilType", "areaInHectares"):
+                if farm.get(k):
+                    parts.append(f"{k}:{farm.get(k)}")
+            if parts:
+                farm_summary = "Farm details: " + ", ".join(parts) + "\n\n"
+        prompt = f"{get_prompt(lang)}\n\n{farm_summary}Farmer query: {query}\n\nGive short actionable steps."
+        text, err = hf_generate_text(prompt, model=HF_MODEL, max_tokens=256, temperature=0.2)
+        if err:
+            # Log and provide fallback
+            print("HF generation error:", err)
+            fallback = {
+                "en": "AI currently unavailable. I can still provide local rules: try asking for 'fertilizer', 'irrigation', 'pest' or 'soil test'.",
+                "kn": "AI ಲಭ್ಯವಿಲ್ಲ. ದಯವಿಟ್ಟು 'fertilizer', 'irrigation', 'pest' ಅಥವಾ 'soil test' ಕೇಳಿ."
+            }
+            return fallback[lang], False, ["Fertilizer", "Irrigation", "Pest check"], session_key
+        if not text:
+            fallback = {"en": "No AI response generated.", "kn": "ಯಾವುದೇ ಉತ್ತರ ಸೃಷ್ಟಿಸಲಾಗಲಿಲ್ಲ."}
+            return fallback[lang], False, ["Fertilizer", "Pest check"], session_key
+        return text.strip(), False, ["Crop stage", "Pest check", "Soil test"], session_key
+    except Exception as e:
+        print("crop_advisory exception:", e)
+        tb = traceback.format_exc()
+        print(tb)
+        fallback = {"en": "AI error occurred.", "kn": "AI ದೋಷ ಸಂಭವಿಸಿದೆ."}
+        return fallback[lang], False, ["Fallback actions"], session_key
+
+# =========================================================
+# Router — identify intents and call modules
+# =========================================================
+def route(query: str, user_id: str, lang: str, session_key: str):
+    q = query.lower().strip()
+    # Intent checks (order matters)
+    if any(tok in q for tok in ["soil test", "soil testing", "soil centre", "soil center"]):
+        text, voice, suggestions = ("Soil testing center lookup not implemented for all states. Update farm details.", True, ["Update farm details"])
+        return {"response_text": text, "voice": voice, "suggestions": suggestions}
+    if any(tok in q for tok in ["timeline", "activity log", "farm activity"]):
+        # call farm_timeline (if implemented)
+        logs = firebase_get(f"Users/{user_id}/farmActivityLogs")
+        if not logs:
+            return {"response_text": "No activity logs found.", "voice": False, "suggestions": ["Add activity"]}
+        # Build a quick summary
+        summaries = []
+        for crop, entries in (logs.items() if isinstance(logs, dict) else []):
+            summaries.append(f"{crop}: {len(entries)} activities" if isinstance(entries, dict) else f"{crop}: activity")
+        return {"response_text": "\n".join(summaries), "voice": False, "suggestions": ["View timeline"]}
+    if any(tok in q for tok in ["weather", "rain", "forecast"]):
+        report, sug, voice = weather_advisory(user_id, lang) if 'weather_advisory' in globals() else ("Weather module not configured.", [], False)
+        return {"response_text": report, "voice": voice, "suggestions": sug}
+    if any(tok in q for tok in ["price", "market", "mandi"]):
+        t, v, s = market_price(query, lang) if 'market_price' in globals() else ("Market module not configured.", False, ["Ask price"])
+        return {"response_text": t, "voice": v, "suggestions": s}
+    if "crop stage" in q or q == "stage" or "stage" in q:
+        t, v, s = get_latest_crop_stage(user_id, lang) if 'get_latest_crop_stage' in globals() else ("No crop stage module.", False, ["Add activity"])
+        return {"response_text": t, "voice": v, "suggestions": s}
+    if any(tok in q for tok in ["pest", "disease", "leaf", "spots", "yellowing", "curl", "blight", "fungus"]):
+        # For symptom heavy queries use advanced diagnosis
+        diag_text, voice, sugg = diagnose_advanced(query, user_crop=None, lang=lang)
+        return {"response_text": diag_text, "voice": voice, "suggestions": sugg}
+    if "fertilizer" in q or "fertiliser" in q or "apply fertilizer" in q:
+        # Try to detect crop & stage from farmActivityLogs
+        logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
+        latest_crop = None; latest_stage = None; latest_ts = -1
+        if isinstance(logs, dict):
+            for crop, entries in logs.items():
+                if isinstance(entries, dict):
+                    for aid, data in entries.items():
+                        ts = data.get("timestamp", 0)
+                        if ts and ts > latest_ts:
+                            latest_ts = ts
+                            latest_crop = data.get("cropName", crop)
+                            latest_stage = data.get("stage", "")
+        if not latest_crop:
+            msg = ("Please provide crop and stage (e.g., 'fertilizer for paddy tillering')" if lang == "en" else "ದಯವಿಟ್ಟು ಬೆಳೆ ಮತ್ತು ಹಂತ ನೀಡಿ.")
+            return {"response_text": msg, "voice": False, "suggestions": ["Provide crop & stage"]}
+        t, v, s = fertilizer_calculator(latest_crop, latest_stage, user_id, lang)
+        return {"response_text": t, "voice": v, "suggestions": s}
+    if any(tok in q for tok in ["pesticide", "spray", "aphid", "fruit borer"]):
+        pest = None
+        for key in PESTICIDE_DB.keys():
+            if key in q:
+                pest = key
+                break
+        if not pest:
+            msg = ("Please tell me the pest name or upload a photo (e.g., 'aphid')." if lang == "en" else "ದಯವಿಟ್ಟು ಕೀಟದ ಹೆಸರು ಅಥವಾ ಫೋಟೋ ನೀಡಿ.")
+            return {"response_text": msg, "voice": False, "suggestions": ["Upload photo", "aphid"]}
+        t, v, s = pesticide_recommendation("", pest, lang)
+        return {"response_text": t, "voice": v, "suggestions": s}
+    if any(tok in q for tok in ["irrigation", "water", "irrigate"]):
+        logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
+        latest_crop = None; latest_stage = None; latest_ts = -1
+        if isinstance(logs, dict):
+            for crop, entries in logs.items():
+                if isinstance(entries, dict):
+                    for aid, data in entries.items():
+                        ts = data.get("timestamp", 0)
+                        if ts and ts > latest_ts:
+                            latest_ts = ts
+                            latest_crop = data.get("cropName", crop)
+                            latest_stage = data.get("stage", "")
+        if not latest_crop:
+            msg = ("Provide crop & stage for irrigation advice." if lang == "en" else "ನೀರಾವರಿ ಸಲಹೆಗೆ ಬೆಳೆ ಮತ್ತು ಹಂತ ನೀಡಿ.")
+            return {"response_text": msg, "voice": False, "suggestions": ["Provide crop & stage"]}
+        t, v, s = irrigation_schedule(latest_crop, latest_stage, user_id, lang)
+        return {"response_text": t, "voice": v, "suggestions": s}
+    if "yield" in q or "estimate" in q or "production" in q:
+        crop = None
+        for c in list(BASE_YIELD_TON_PER_HA.keys()):
+            if c in q:
+                crop = c
+                break
+        if not crop:
+            logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
+            latest_crop = None; latest_ts = -1
+            if isinstance(logs, dict):
+                for crop_k, entries in logs.items():
+                    if isinstance(entries, dict):
+                        for aid, data in entries.items():
+                            ts = data.get("timestamp", 0)
+                            if ts and ts > latest_ts:
+                                latest_ts = ts
+                                latest_crop = data.get("cropName", crop_k)
+            crop = latest_crop or list(BASE_YIELD_TON_PER_HA.keys())[0]
+        t, v, s = yield_prediction(crop, user_id, lang)
+        return {"response_text": t, "voice": v, "suggestions": s}
+    # default -> HF crop advisory
+    t, v, s, sid = crop_advisory(user_id, query, lang, session_key)
+    return {"response_text": t, "voice": v, "suggestions": s, "session_id": sid}
+
+
+# =========================================================
+# Endpoint
+# =========================================================        
+@app.post("/chat/send", response_model=ChatResponse)
+async def chat_send(payload: ChatQuery):
+    user_query = payload.user_query.strip()
+    if not user_query:
+        raise HTTPException(status_code=400, detail="Query cannot be empty.")
+    lang = get_language(payload.user_id)
+    session_key = payload.session_id or f"{payload.user_id}-{lang}"
+    try:
+        result = route(user_query, payload.user_id, lang, session_key)
+    except Exception as e:
+        print("Processing error:", e)
+        raise HTTPException(status_code=500, detail=f"Processing error: {e}")
+    audio_url = None
+    try:
+        if result.get("response_text"):
+            audio_url = generate_tts_audio(result["response_text"], lang)
+    except Exception as e:
+        print("TTS generation failed:", e)
+    return ChatResponse(
+        session_id=result.get("session_id", session_key),
+        response_text=result.get("response_text", "Sorry, could not process."),
+        language=lang,
+        suggestions=result.get("suggestions", []),
+        voice=True,
+        audio_url=audio_url,
+        metadata={"timestamp": datetime.utcnow().isoformat()}
+    )
+
+# =========================
+# Additional helper stubs (market_price, weather_advisory, get_latest_crop_stage)
+# You can replace/extend these with full versions from your earlier file.
+# =========================
+
+def get_latest_crop_stage(user_id: str):
+    """
+    Reads Firebase farmActivityLogs and returns:
+    {
+        "crop": "paddy",
+        "stage": "tillering",
+        "timestamp": 1712345678
+    }
+    Returns None if no stage exists.
+    """
+
+    logs = firebase_get(f"Users/{user_id}/farmActivityLogs")
+    if not logs or not isinstance(logs, dict):
+        return None
+
+    latest_crop = None
+    latest_stage = None
+    latest_ts = -1
+
+    # logs: { "paddy": { "logId1": {...}, "logId2": {...} }, "chilli": {...} }
+    for crop, entries in logs.items():
+        if not isinstance(entries, dict):
+            continue
+
+        for _, entry in entries.items():
+            if not isinstance(entry, dict):
+                continue
+
+            ts = entry.get("timestamp")
+            stage = entry.get("stage")
+
+            if ts and stage:
+                if ts > latest_ts:
+                    latest_ts = ts
+                    latest_crop = entry.get("cropName", crop)
+                    latest_stage = stage
+
+    if latest_crop and latest_stage:
+        return {
+            "crop": latest_crop.lower(),
+            "stage": latest_stage.lower(),
+            "timestamp": latest_ts
+        }
+
+    return None
+
+def get_user_location(user_id: str):
+    """
+    Returns user's district & taluk from Firebase:
+    Path: Users/{user_id}/farmDetails
+    Returns:
+        { "district": "...", "taluk": "..." }
+    or None if not available.
+    """
+
+    farm = firebase_get(f"Users/{user_id}/farmDetails")
+    if not farm or not isinstance(farm, dict):
+        return None
+
+    district = farm.get("district")
+    taluk = farm.get("taluk")
+
+    if not district or not taluk:
+        return None
+
+    return {
+        "district": district,
+        "taluk": taluk
+    }
+
+def soil_testing_center(user_id: str, language: str):
+    """
+    Fetch nearest soil testing center based on user's district & taluk.
+    Path: SoilTestingCenters/Karnataka/{district}/{taluk}
+    """
+
+    # Load user's saved farm location
+    loc = get_user_location(user_id)
+    if not loc:
+        msg = {
+            "en": "Farm location not found. Please update your district and taluk in farm details.",
+            "kn": "ಫಾರಂ ಸ್ಥಳದ ಮಾಹಿತಿ ಕಂಡುಬರಲಿಲ್ಲ. ದಯವಿಟ್ಟು ಜಿಲ್ಲೆ ಮತ್ತು ತಾಲೂಕು farmDetails ನಲ್ಲಿ ನವೀಕರಿಸಿ."
+        }
+        return msg[language], True, ["Update farm details"]
+
+    district = loc.get("district")
+    taluk = loc.get("taluk")
+
+    if not district or not taluk:
+        msg = {
+            "en": "District or taluk missing in your farm details.",
+            "kn": "ಫಾರಂ ವಿವರಗಳಲ್ಲಿ ಜಿಲ್ಲೆ ಅಥವಾ ತಾಲೂಕು ಲಭ್ಯವಿಲ್ಲ."
+        }
+        return msg[language], True, ["Update farm details"]
+
+    # Firebase read
+    centers = firebase_get(f"SoilTestingCenters/Karnataka/{district}/{taluk}")
+
+    if not centers:
+        msg = {
+            "en": f"No soil testing center found for {taluk}, {district}.",
+            "kn": f"{district} ಜಿಲ್ಲೆಯ {taluk} ತಾಲೂಕಿನ ಮಣ್ಣಿನ ಪರೀಕ್ಷಾ ಕೇಂದ್ರ ಲಭ್ಯವಿಲ್ಲ."
+        }
+        return msg[language], True, ["Update farm details"]
+
+    # Extract center information
+    for _, info in centers.items():
+        if isinstance(info, dict):
+            name = info.get("name", "N/A")
+            address = info.get("address", "N/A")
+            contact = info.get("contact", "N/A")
+
+            if language == "kn":
+                text = (
+                    f"🧪 ಮಣ್ಣಿನ ಪರೀಕ್ಷಾ ಕೇಂದ್ರ:\n"
+                    f"{name}\n\n"
+                    f"📍 ವಿಳಾಸ: {address}\n"
+                    f"📞 ಸಂಪರ್ಕ: {contact}"
+                )
+            else:
+                text = (
+                    f"🧪 Soil Testing Center:\n"
+                    f"{name}\n\n"
+                    f"📍 Address: {address}\n"
+                    f"📞 Contact: {contact}"
+                )
+
+            return text, True, ["Directions", "Call center"]
+
+    # Fallback
+    no_data = {
+        "en": "No center data available.",
+        "kn": "ಮಣ್ಣಿನ ಪರೀಕ್ಷಾ ಕೇಂದ್ರದ ಮಾಹಿತಿ ಲಭ್ಯವಿಲ್ಲ."
+    }
+    return no_data[language], True, []
+
+def pest_disease(query: str, language: str):
+    q = query.lower().strip()
+
+    # ---------------------------------------------------------
+    # Keyword-based fast symptom match
+    # ---------------------------------------------------------
+    SYMPTOM_MAP = {
+        "curl": {
+            "disease_en": "Leaf curl virus or sucking pests (whiteflies/aphids).",
+            "disease_kn": "ಎಲೆ ಕರ್ಭಟ ವೈರಸ್ ಅಥವಾ ಸ್ಯಕ್ಕಿಂಗ್ ಕೀಟಗಳು (ವೈಟ್‌ಫ್ಲೈ/ಆಫಿಡ್).",
+            "advice_en": "Remove affected shoots and spray 2% neem oil or imidacloprid (as per label).",
+            "advice_kn": "ಸೋಂಕಿತ ಕೊಂಬೆಗಳನ್ನು ತೆಗೆದುಹಾಕಿ ಮತ್ತು 2% ನೀಮ್ ಎಣ್ಣೆ ಅಥವಾ ಲೇಬಲ್ ಪ್ರಕಾರ ಇಮಿಡಾಕ್ಲೋಪ್ರಿಡ್ ಸಿಂಪಡಿಸಿ.",
+            "suggestions": ["Neem spray", "Pest control guide"]
+        },
+
+        "yellow": {
+            "disease_en": "Likely nutrient deficiency (Nitrogen/Iron) or overwatering.",
+            "disease_kn": "ಪೋಷಕಾಂಶ ಕೊರತೆ (ನೈಟ್ರೋಜನ್/ಐರನ್) ಅಥವಾ ಹೆಚ್ಚಾದ ನೀರಾವರಿ.",
+            "advice_en": "Check soil moisture, reduce watering, apply urea or micronutrient mixture.",
+            "advice_kn": "ಮಣ್ಣಿನ ತೇವಾಂಶ ಪರಿಶೀಲಿಸಿ, ನೀರಾವರಿ ಕಡಿಮೆ ಮಾಡಿ, ಯೂರಿಯಾ ಅಥವಾ ಸೂಕ್ಷ್ಮಾಂಶ ಮಿಶ್ರಣ ನೀಡಿ.",
+            "suggestions": ["Soil test", "Nutrient guide"]
+        },
+
+        "spots": {
+            "disease_en": "Leaf spots indicate fungal disease (Anthracnose / Cercospora).",
+            "disease_kn": "ಎಲೆಗಳಲ್ಲಿ ಕಲೆಗಳು ಫಂಗಲ್ ರೋಗ (ಆಂಥ್ರಾಕ್ನೋಸ್ / ಸರ್ಸ್ಪೋರಾ) ಸೂಚನೆ.",
+            "advice_en": "Remove infected leaves and spray a recommended fungicide.",
+            "advice_kn": "ಸೋಂಕಿತ ಎಲೆಗಳನ್ನು ತೆಗೆದುಹಾಕಿ ಮತ್ತು ಶಿಫಾರಸು ಮಾಡಿದ ಫಂಗಿಸೈಡ್ ಸಿಂಪಡಿಸಿ.",
+            "suggestions": ["Fungicide list", "Remove infected leaves"]
+        },
+
+        "brown": {
+            "disease_en": "Brown patches suggest blight or leaf spot disease.",
+            "disease_kn": "ಬ್ರೌನ್ ಕಲೆಗಳು ಬ್ಲೈಟ್ ಅಥವಾ ಎಲೆ ರೋಗದ ಸೂಚನೆ.",
+            "advice_en": "Improve drainage and spray copper oxychloride.",
+            "advice_kn": "ನೀರು ನಿಕಾಸ ಸುಧಾರಿಸಿ ಮತ್ತು ಕಾಪರ್ ಆಕ್ಸಿ ಕ್ಲೋರೈಡ್ ಸಿಂಪಡಿಸಿ.",
+            "suggestions": ["Blight treatment", "Drainage tips"]
+        },
+
+        "wilt": {
+            "disease_en": "Possible wilt (Fusarium/Bacterial).",
+            "disease_kn": "ವಿಲ್ಟ್ ರೋಗ (ಫ್ಯೂಸೇರಿಯಮ್/ಬ್ಯಾಕ್ಟೀರಿಯಲ್) ಸಾಧ್ಯತೆ.",
+            "advice_en": "Ensure good drainage, apply Trichoderma around roots.",
+            "advice_kn": "ನೀರು ನಿಕಾಸ ಸುಧಾರಿಸಿ, ಬೇರುಗಳ ಬಳಿ ಟ್ರೈಕೋಡರ್ಮಾ ಬಳಸಿ.",
+            "suggestions": ["Root treatment", "Soil solarization"]
+        },
+
+        "holes": {
+            "disease_en": "Leaf holes indicate caterpillar or leaf-eating insects.",
+            "disease_kn": "ಎಲೆಗಳಲ್ಲಿ ರಂಧ್ರಗಳು ಇರುವುದು ಹುಳು / ಎಲೆ ತಿನ್ನುವ ಕೀಟಗಳ ಲಕ್ಷಣ.",
+            "advice_en": "Use pheromone traps and spray neem oil.",
+            "advice_kn": "ಫೆರೊಮೋನ್ ಟ್ರ್ಯಾಪ್‌ಗಳು ಮತ್ತು ನೀಮ್ ಎಣ್ಣೆ ಸಿಂಪಡಿಸಿ.",
+            "suggestions": ["Pheromone traps", "Caterpillar management"]
+        },
+
+        "white powder": {
+            "disease_en": "Powdery mildew detected.",
+            "disease_kn": "ಪೌಡರಿ ಮಿಲ್ಡ್ಯೂ ರೋಗ ಕಂಡುಬಂದಿದೆ.",
+            "advice_en": "Spray wettable sulfur or recommended fungicide.",
+            "advice_kn": "ವೆಟ್ಟಬಲ್ ಸಲ್ಫರ್ ಅಥವಾ ಶಿಫಾರಸು ಮಾಡಿದ ಫಂಗಿಸೈಡ್ ಸಿಂಪಡಿಸಿ.",
+            "suggestions": ["Sulphur spray", "Humidity control"]
+        },
+
+        "black spots": {
+            "disease_en": "Black spots indicate fungal or bacterial infection.",
+            "disease_kn": "ಕಪ್ಪು ಕಲೆಗಳು ಫಂಗಲ್ ಅಥವಾ ಬ್ಯಾಕ್ಟೀರಿಯಲ್ ರೋಗ.",
+            "advice_en": "Remove affected leaves and avoid overhead irrigation.",
+            "advice_kn": "ಸೋಂಕಿತ ಎಲೆಗಳನ್ನು ತೆಗೆದುಹಾಕಿ ಮತ್ತು ಮೇಲಿನಿಂದ ನೀರು ಎರೆಯುವುದನ್ನು ತಪ್ಪಿಸಿ.",
+            "suggestions": ["Disease control", "Irrigation tips"]
+        },
+
+        "sticky": {
+            "disease_en": "Sticky leaves indicate honeydew from sucking pests (aphids/whiteflies).",
+            "disease_kn": "ಎಲೆಗಳು ಅಂಟಿಕೊಂಡಿರುವುದು ವೈಟ್‌ಫ್ಲೈ/ಆಫಿಡ್ ಕೀಟದ ಹನಿ.",
+            "advice_en": "Spray neem oil or soap solution.",
+            "advice_kn": "ನೀಮ್ ಎಣ್ಣೆ ಅಥವಾ ಸಾಬೂನು ದ್ರಾವಣ ಸಿಂಪಡಿಸಿ.",
+            "suggestions": ["Neem spray", "IPM method"]
+        }
+    }
+
+    # ---------------------------------------------------------
+    # Check for symptom patterns
+    # ---------------------------------------------------------
+    for symptom, data in SYMPTOM_MAP.items():
+        if symptom in q:
+            if language == "kn":
+                text = f"{data['disease_kn']}\n\n➡ ಪರಿಹಾರ:\n{data['advice_kn']}"
+            else:
+                text = f"{data['disease_en']}\n\n➡ Solution:\n{data['advice_en']}"
+
+            return text, True, data["suggestions"]
+
+    # ---------------------------------------------------------
+    # No direct match → fallback generic response
+    # ---------------------------------------------------------
+    fallback = {
+        "en": "I could not identify the issue clearly. Please provide more details or upload a photo.",
+        "kn": "ಸಮಸ್ಯೆಯನ್ನು ನಿಖರವಾಗಿ ಗುರುತಿಸಲು ಸಾಧ್ಯವಾಗಲಿಲ್ಲ. ದಯವಿಟ್ಟು ಹೆಚ್ಚಿನ ವಿವರ ನೀಡಿ ಅಥವಾ ಫೋಟೋ ಅಪ್ಲೋಡ್ ಮಾಡಿ."
+    }
+
+    return fallback[language], True, ["Upload photo", "Show common symptoms"]
+
+def farm_timeline(user_id: str, language: str):
+    """
+    Fetches all activity logs from Firebase for the farmer and returns a summary  
+    of the latest activity for each crop.
+
+    Returns:
+        (text, voice_flag, suggestions_list)
+    """
+    logs = firebase_get(f"Users/{user_id}/farmActivityLogs")
+
+    if not logs or not isinstance(logs, dict):
+        msg = "ಚಟುವಟಿಕೆ ಲಾಗ್ ಕಂಡುಬರಲಿಲ್ಲ." if language == "kn" else "No activity logs found."
+        return msg, False, ["Add activity"]
+
+    summaries = []
+
+    for crop, entries in logs.items():
+
+        if not isinstance(entries, dict):
+            continue
+
+        latest_entry = None
+        latest_ts = -1
+
+        # Find latest timestamp for this crop
+        for act_id, data in entries.items():
+            if not isinstance(data, dict):
+                continue
+
+            ts = data.get("timestamp", 0)
+            if ts and ts > latest_ts:
+                latest_ts = ts
+                latest_entry = data
+
+        if latest_entry:
+            crop_name = latest_entry.get("cropName", crop)
+            activity = latest_entry.get("subActivity", "")
+            stage = latest_entry.get("stage", "")
+
+            if language == "kn":
+                summaries.append(f"{crop_name}: ಇತ್ತೀಚಿನ ಚಟುವಟಿಕೆ {activity} (ಹಂತ: {stage})")
+            else:
+                summaries.append(f"{crop_name}: latest activity {activity} (stage: {stage})")
+
+    if not summaries:
+        msg = "ಯಾವುದೇ ಇತ್ತೀಚಿನ ಚಟುವಟಿಕೆಗಳು ಕಂಡುಬರಲಿಲ್ಲ." if language == "kn" else "No recent activities found."
+        return msg, False, ["Add activity"]
+
+    # Final summary
+    timeline_text = "\n".join(summaries)
+    return timeline_text, False, ["View full timeline"]
+
+def get_mock_weather_for_district(district):
+    # Simple fallback mock weather (used if live fetch fails in irrigation schedule)
+    return {
+        "temp": 30,
+        "humidity": 70,
+        "wind": 8,
+        "rain_next_24h_mm": 0
+    }
+
+def translate_weather_suggestions_kn(sugs):
+    mapping = {
+        "High heat – give afternoon irrigation and mulch.": "ಹೆಚ್ಚು ಬಿಸಿಲು – ಮಧ್ಯಾಹ್ನ ನೀರಾವರಿ ಮಾಡಿ ಮತ್ತು ಮಲ್ಚಿಂಗ್ ಮಾಡಿ.",
+        "Low temperature – avoid fertilizer today.": "ಕಡಿಮೆ ತಾಪಮಾನ – ಇಂದು ರಸಗೊಬ್ಬರ ಬಳಕೆ ಬೇಡ.",
+        "Rainfall occurring – stop irrigation for 24 hours.": "ಮಳೆ ಬರುತ್ತಿದೆ – 24 ಗಂಟೆಗಳ ಕಾಲ ನೀರಾವರಿ ನಿಲ್ಲಿಸಿ.",
+        "No rain – irrigation recommended today.": "ಮಳೆಯಿಲ್ಲ – ಇಂದು ನೀರಾವರಿ ಮಾಡಿರಿ.",
+        "High humidity – fungal disease chances are high.": "ಹೆಚ್ಚು ತೇವಾಂಶ – ಫಂಗಸ್ ರೋಗದ ಸಾಧ್ಯತೆ ಹೆಚ್ಚು.",
+        "Low humidity – increase irrigation frequency.": "ಕಡಿಮೆ ತೇವಾಂಶ – ನೀರಾವರಿ ಪ್ರಮಾಣ ಹೆಚ್ಚಿಸಿ.",
+        "High wind – avoid spraying pesticides.": "ಬಲವಾದ ಗಾಳಿ – ಕೀಟನಾಶಕ ಸಿಂಪಡಣೆ ಬೇಡ.",
+        "Rain during flowering – flower drop likely.": "ಹೂ ಹಂತದಲ್ಲಿ ಮಳೆ – ಹೂ ಬಿದ್ದು ಹೋಗುವ ಸಾಧ್ಯತೆ.",
+        "Rain coming – postpone harvest.": "ಮಳೆ ಬರಲಿದೆ – ಕೊಯ್ತನ್ನು ಮುಂದೂಡಿ."
+    }
+    return [mapping.get(s, s) for s in sugs]
+    
+def weather_advisory(user_id: str, language: str):
+    farm = get_user_farm_details(user_id)
+    if not farm or "district" not in farm:
+        msg = {
+            "en": "Farm district missing. Update farm details.",
+            "kn": "ಫಾರಂ ಜಿಲ್ಲೆಯ ಮಾಹಿತಿ ಇಲ್ಲ. farmDetails ನವೀಕರಿಸಿ."
+        }
+        return msg[language], [], False
+
+    district = farm["district"]
+    weather = fetch_weather_by_location(district)
+
+    if not weather:
+        return ("Unable to fetch weather data.", [], False)
+
+    suggestions = weather_suggestion_engine(weather, None, language)
+
+    if language == "kn":
+        report = (
+            f"{district} ಹವಾಮಾನ:\n"
+            f"ಸ್ಥಿತಿ: {weather['description']}\n"
+            f"ತಾಪಮಾನ: {weather['temp']}°C\n"
+            f"ತೇವಾಂಶ: {weather['humidity']}%\n"
+            f"ಗಾಳಿ: {weather['wind']} km/h\n"
+            f"ಮಳೆ (1h): {weather['rain']} mm\n"
+        )
+    else:
+        report = (
+            f"Weather in {district}:\n"
+            f"Condition: {weather['description']}\n"
+            f"Temperature: {weather['temp']}°C\n"
+            f"Humidity: {weather['humidity']}%\n"
+            f"Wind: {weather['wind']} km/h\n"
+            f"Rain (1h): {weather['rain']} mm\n"
+        )
+
+    return report, suggestions, True
+
+def match_symptoms(text):
+    return _extract_symptom_keys(text)
+
+def _score_candidates(symptom_keys: list, crop: Optional[str] = None):
+    from collections import defaultdict
+    scores = defaultdict(float)
+    evidence = defaultdict(list)
+    for sk in symptom_keys:
+        mapped = SYMPTOM_DB.get(sk, [])
+        for cand in mapped:
+            base_weight = 1.0
+            if len(sk.split()) >= 2:
+                base_weight += 0.25
+            scores[cand] += base_weight
+            evidence[cand].append(f"symptom:{sk}")
+    if crop:
+        crop_l = crop.lower()
+        crop_map = CROP_SYMPTOM_WEIGHT.get(crop_l, {})
+        for cand, boost in crop_map.items():
+            scores[cand] += boost
+            evidence[cand].append(f"crop_boost:{crop_l}")
+    if not scores:
+        return []
+    total = sum(scores.values())
+    ranked = []
+    for cand, sc in sorted(scores.items(), key=lambda x: -x[1]):
+        confidence = round(min(0.99, sc / (total + 1e-6)), 2)
+        ranked.append((cand, round(sc, 2), confidence, evidence.get(cand, [])))
+    return ranked
+
+def diagnose_pest(user_text, language):
+    matches = match_symptoms(user_text)
+    if not matches:
+        fallback = {
+            "en": "I could not identify the pest from the symptoms. Please describe more clearly or send a photo.",
+            "kn": "ಲಕ್ಷಣಗಳಿಂದ ಕೀಟವನ್ನು ಗುರುತಿಸಲು ಸಾಧ್ಯವಾಗಲಿಲ್ಲ. ದಯವಿಟ್ಟು ಹೆಚ್ಚಿನ ವಿವರ ನೀಡಿ ಅಥವಾ ಫೋಟೋ ಕಳುಹಿಸಿ."
+        }
+        return fallback[language], ["Upload photo", "Show common pest symptoms"]
+
+    # Take top 1–2 matches
+    result = matches[:2]
+
+    response = f"Possible issues based on symptoms:\n" + "\n".join(f"- {d}" for d in result)
+    suggestions = ["Pesticide recommendations", "Prevention steps", "Check crop stage"]
+
+    return response, suggestions
+    
+def weather_suggestion_engine(weather, crop_stage=None, language="en"):
+    temp = weather["temp"]
+    humidity = weather["humidity"]
+    wind = weather["wind"]
+    rain = weather["rain"]
+    cond = weather["condition"]
+
+    suggestions = []
+
+    # Temperature Logic
+    if temp > 35:
+        suggestions.append("High heat – give afternoon irrigation and mulch.")
+    elif temp < 15:
+        suggestions.append("Low temperature – avoid fertilizer today.")
+
+    # Rain Logic
+    if rain > 3:
+        suggestions.append("Rainfall occurring – stop irrigation for 24 hours.")
+    else:
+        suggestions.append("No rain – irrigation recommended today.")
+
+    # Humidity Logic
+    if humidity > 80:
+        suggestions.append("High humidity – fungal disease chances are high.")
+    elif humidity < 35:
+        suggestions.append("Low humidity – increase irrigation frequency.")
+
+    # Wind Logic
+    if wind > 20:
+        suggestions.append("High wind – avoid spraying pesticides.")
+
+    # Crop-stage weather fusion
+    if crop_stage:
+        st = crop_stage.lower()
+        if "flower" in st and cond == "Rain":
+            suggestions.append("Rain during flowering – flower drop likely.")
+        if "harvest" in st and rain > 0:
+            suggestions.append("Rain coming – postpone harvest.")
+
+    if language == "kn":
+        suggestions = translate_weather_suggestions_kn(suggestions)
+
+    return suggestions
+
+def weather_crop_fusion(user_id: str, crop: str, stage: str, lang: str):
+    farm = get_user_farm_details(user_id)
+    district = farm.get("district", "unknown")
+
+    weather = fetch_weather_by_location(district)
+    if not weather:
+        return ("Weather data unavailable.", False, ["Retry"])
+
+    # Stage advice
+    stage_advice = stage_recommendation_engine(crop, stage, lang)
+
+    # Weather fusion suggestions
+    fusion = weather_suggestion_engine(weather, crop_stage=stage, language=lang)
+
+    # Build final message
+    if lang == "kn":
+        report = (
+            f"{district} ಹವಾಮಾನ:\n"
+            f"ತಾಪಮಾನ: {weather['temp']}°C | ತೇವಾಂಶ: {weather['humidity']}%\n"
+            f"ಹಂತ: {crop} – {stage}\n\n"
+            f"ಹಂತ ಸಲಹೆ:\n{stage_advice}\n\n"
+            f"ಹವಾಮಾನ ಆಧಾರಿತ ಹೆಚ್ಚುವರಿ ಸಲಹೆಗಳು:\n- " + "\n- ".join(fusion)
+        )
+    else:
+        report = (
+            f"Weather in {district}:\n"
+            f"Temp: {weather['temp']}°C | Humidity: {weather['humidity']}%\n"
+            f"Stage: {crop} – {stage}\n\n"
+            f"Stage Recommendation:\n{stage_advice}\n\n"
+            f"Weather-based Additional Advice:\n- " + "\n- ".join(fusion)
+        )
+
+    return report, False, ["Fertilizer", "Pest Check", "Irrigation"]
+
+def crop_advisory(user_id: str, query: str, lang: str, session_key: str):
+    global gemini_client, active_chats
+    try:
+        if not gemini_client:
+            return "AI not configured on server.", False, [], session_key
+        if session_key not in active_chats:
+            if types is None:
+                return "AI configuration incomplete.", False, [], session_key
+            cfg = types.GenerateContentConfig(system_instruction=get_prompt(lang))
+            chat = gemini_client.chats.create(model="gemini-1.5-flash", config=cfg)
+            active_chats[session_key] = chat
+        chat = active_chats[session_key]
+        resp = chat.send_message(query)
+        text = resp.text if hasattr(resp, "text") else str(resp)
+        return text, False, ["Crop stage", "Pest check", "Soil test"], session_key
+
+            
+    except Exception as e:
+        logger.exception("AI error: %s", e)
+        return f"AI error: {e}", False, [], session_key
+        
 def general_agri_knowledge_engine(query: str, lang: str) -> Tuple[str, bool, list]:
     q = query.lower()
 
@@ -2787,85 +3430,176 @@ def general_agri_knowledge_engine(query: str, lang: str) -> Tuple[str, bool, lis
         )
 
     return None, None, None
-# =========================================================
-# Crop stage retrieval (latest activity)
-# =========================================================
-def get_latest_crop_stage(user_id: str, lang: str):
-    logs = firebase_get(f"Users/{user_id}/farmActivityLogs")
-    if not logs:
-        return ("No farm activity found." if lang == "en" else "ಫಾರಂ ಚಟುವಟಿಕೆ ಕಂಡುಬರಲಿಲ್ಲ."), False, ["Add activity"]
-
-    latest_ts = -1
-    latest_crop = None
-    latest_stage = None
-    for crop, entries in logs.items():
-        if isinstance(entries, dict):
-            for act_id, data in entries.items():
-                ts = data.get("timestamp", 0)
-                if ts and ts > latest_ts:
-                    latest_ts = ts
-                    latest_crop = data.get("cropName", crop)
-                    latest_stage = data.get("stage", "Unknown")
-    # build response with stage-wise recommendation
-    rec = stage_recommendation_engine(latest_crop, latest_stage, lang)
-    if lang == "kn":
-        header = f"{latest_crop} ಬೆಳೆ ಪ್ರಸ್ತುತ ಹಂತ: {latest_stage}\n\n"
-    else:
-        header = f"Current stage of {latest_crop}: {latest_stage}\n\n"
-    return header + rec, False, ["Next actions", "Fertilizer advice", "Pest check"]
 
 # =========================================================
-# Endpoint
+# HUGGINGFACE FALLBACK LLM (ZEHPYR 7B)
 # =========================================================
+
+import requests
+
+HF_MODEL = "HuggingFaceH4/zephyr-7b-beta"
+HF_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
+
+def hf_generate(prompt: str) -> str:
+    """
+    Lightweight HF Inference API call.
+    """
+    try:
+        url = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
+        headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+
+        payload = {"inputs": prompt, "parameters": {"max_new_tokens": 180}}
+
+        r = requests.post(url, headers=headers, json=payload, timeout=45)
+
+        if r.status_code != 200:
+            return f"HF Error: {r.text}"
+
+        data = r.json()
+        if isinstance(data, list) and "generated_text" in data[0]:
+            return data[0]["generated_text"]
+
+        return str(data)
+
+    except Exception as e:
+        return f"HF failure: {e}"
+
+def route_intent(query: str, user_id: str, lang: str, session_key: str):
+    q = query.lower()
+
+    # 1. Soil test center
+    if any(x in q for x in ["soil test", "soil center", "testing center", "soil lab"]):
+        text, voice, sug = soil_testing_center(user_id, lang)
+        return text, sug, True, session_key
+
+    # 2. Farm timeline
+    if "timeline" in q or "activity" in q:
+        text, voice, sug = farm_timeline(user_id, lang)
+        return text, sug, voice, session_key
+
+    # 3. Weather advisory (full weather report)
+    if "weather" in q or "rain" in q or "forecast" in q:
+        text, sug, voice = weather_advisory(user_id, lang)
+        return text, sug, voice, session_key
+
+    # 4. Pest / disease direct keywords
+    if any(x in q for x in ["pest", "disease", "spot", "curl", "yellow", "larva"]):
+        text, sug = diagnose_pest(query, lang)
+        return text, sug, True, session_key
+
+    # 5. Market price
+    if "price" in q or "mandi" in q or "rate" in q:
+        text, voice, sug = market_price(query, lang)
+        return text, sug, voice, session_key
+
+    # 6. Stage-wise recommendation
+    if "stage" in q or "growth" in q:
+        crop, stage = get_latest_crop_stage(user_id)
+        if crop:
+            text = stage_recommendation_engine(crop, stage, lang)
+            return text, ["Fertilizer", "Pest check", "Irrigation"], True, session_key
+        return ("No crop stage found." if lang == "en" else "ಬೆಳೆಯ ಹಂತ ದೊರಕಲಿಲ್ಲ."), [], False, session_key
+
+    # 7. General agri-knowledge
+    ga, voice, sug = general_agri_knowledge_engine(query, lang)
+    if ga:
+        return ga, sug, voice, session_key
+
+    # 8. Default → HuggingFace LLM
+    prompt = f"You are KrishiSakhi, an agriculture assistant. Respond in {lang}. {query}"
+    text = hf_generate(prompt)
+    return text, ["Crop stage", "Pest check", "Soil test"], True, session_key
+
+from gtts import gTTS
+import uuid
+
+def generate_tts(text: str, lang: str):
+    """
+    Always generate an mp3 file for the response (TTS-A mode).
+    """
+    try:
+        audio_id = f"tts_{uuid.uuid4().hex}.mp3"
+        path = f"tts_audio/{audio_id}"
+
+        tts_lang = "kn" if lang == "kn" else "en"
+
+        tts = gTTS(text=text, lang=tts_lang)
+        tts.save(path)
+
+        return f"/tts/{audio_id}"
+
+    except Exception as e:
+        logger.error("TTS error: %s", e)
+        return None
+
 @app.post("/chat/send", response_model=ChatResponse)
 async def chat_send(payload: ChatQuery):
-    user_query = payload.user_query.strip()
-    if not user_query:
+    if not payload.user_query or not payload.user_query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
 
-    # Detect user preferred language (en/kn)
     lang = get_language(payload.user_id)
-
-    # Generate session key
     session_key = payload.session_id or f"{payload.user_id}-{lang}"
 
-    # Route query through intent engine
     try:
-        result = route(user_query, payload.user_id, lang, session_key)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Processing error: {e}")
+        text, suggestions, voice, sid = route_intent(
+            payload.user_query.strip(),
+            payload.user_id,
+            lang,
+            session_key
+        )
 
-    # -------------------------------------------------------------------------
-    # TTS AUDIO GENERATION (Kannada or English)
-    # -------------------------------------------------------------------------
-    audio_url = None
-    try:
-        if result.get("response_text"):
-            audio_url = generate_tts_audio(result["response_text"], lang)
     except Exception as e:
-        print("TTS generation failed:", e)
+        logger.exception("Routing error: %s", e)
+        raise HTTPException(status_code=500, detail=f"Routing failure: {e}")
 
-    # -------------------------------------------------------------------------
-    # Return unified response model
-    # -------------------------------------------------------------------------
+    # Always generate TTS (TTS-A)
+    audio_url = generate_tts(text, lang)
+
     return ChatResponse(
-        session_id=result.get("session_id", session_key),
-        response_text=result.get("response_text", "Sorry, could not process."),
+        session_id=sid,
+        response_text=text,
         language=lang,
-        suggestions=result.get("suggestions", []),
-        voice=True,                    # always speak
-        audio_url=audio_url,           # INCLUDE THE AUDIO URL
-        metadata={"timestamp": datetime.utcnow().isoformat()}
+        suggestions=suggestions,
+        voice=True,               # Always speak
+        metadata={
+            "timestamp": datetime.utcnow().isoformat(),
+            "audio_url": audio_url
+        }
     )
 
 # =========================================================
-# Startup
+# STARTUP INITIALIZATION
 # =========================================================
 @app.on_event("startup")
-def startup():
-    initialize_firebase_credentials()
-    initialize_gemini()
+def startup_event():
+    logger.info("🔵 KS Backend Starting Up...")
 
+    # ---------------------------
+    # Ensure TTS folder exists
+    # ---------------------------
+    if not os.path.exists("tts_audio"):
+        os.makedirs("tts_audio", exist_ok=True)
+        logger.info("📁 Created tts_audio directory")
+
+    # ---------------------------
+    # Initialize Firebase
+    # ---------------------------
+    try:
+        initialize_firebase_credentials()
+        logger.info("✅ Firebase credentials loaded")
+    except Exception as e:
+        logger.error(f"❌ Firebase initialization failed: {e}")
+
+    # ---------------------------
+    # Initialize HuggingFace
+    # ---------------------------
+    global HF_API_KEY
+    if HF_API_KEY:
+        logger.info("✅ HuggingFace API key detected")
+    else:
+        logger.warning("⚠ HuggingFace API key missing! AI fallback may fail.")
+
+    logger.info("🚀 KS Backend Startup Complete")
 
 
 
