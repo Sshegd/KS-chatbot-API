@@ -2544,7 +2544,7 @@ def crop_advisory(user_id: str, query: str, lang: str, session_key: str):
             if types is None:
                 return "AI configuration incomplete.", False, [], session_key
             cfg = types.GenerateContentConfig(system_instruction=get_prompt(lang))
-            chat = gemini_client.chats.create(model="gemini-1.5-flash", config=cfg)
+            chat = gemini_client.chats.create(model="models/gemini-1.5-pro", config=cfg)
             active_chats[session_key] = chat
         chat = active_chats[session_key]
         resp = chat.send_message(query)
@@ -2865,6 +2865,7 @@ async def chat_send(payload: ChatQuery):
 def startup():
     initialize_firebase_credentials()
     initialize_gemini()
+
 
 
 
