@@ -9,15 +9,14 @@ from google.oauth2 import service_account
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from dotenv import load_dotenv
 
-# --------------------------------------------------------------------------
-# 1. Startup Configuration
-# --------------------------------------------------------------------------
-
+# ----------------------------------------
+# LOAD ENV (local only)
+# ----------------------------------------
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL")
-SERVICE_ACCOUNT_FILE_PATH = os.getenv("SERVICE_ACCOUNT_FILE_PATH", "./service_account_key.json")
+SERVICE_ACCOUNT_KEY = os.getenv("SERVICE_ACCOUNT_KEY")  # JSON string
 
 SCOPES = [
     "https://www.googleapis.com/auth/userinfo.email",
@@ -28,101 +27,99 @@ credentials = None
 client = None
 active_chats = {}
 
-app = FastAPI(title="KS_chatbot Gemini API", version="1.0.0")
+app = FastAPI(title="KS Chatbot API", version="3.0.0")
 
-# --------------------------------------------------------------------------
-# 2. Models
-# --------------------------------------------------------------------------
 
+# ----------------------------------------
+# MODELS
+# ----------------------------------------
 class ChatQuery(BaseModel):
     user_id: str
     user_query: str
     session_id: str
+
 
 class ChatResponse(BaseModel):
     session_id: str
     response_text: str
     language: str
 
-# --------------------------------------------------------------------------
-# 3. Initialization Functions
-# --------------------------------------------------------------------------
 
+# ----------------------------------------
+# INITIALIZE GEMINI
+# ----------------------------------------
 def initialize_gemini_client():
     global client
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
         print("Gemini Client Initialized.")
     except Exception as e:
-        print(f"FATAL: Could not initialize Gemini Client: {e}")
+        print(f"FATAL: Gemini Init Failed → {e}")
 
+
+# ----------------------------------------
+# INITIALIZE FIREBASE
+# ----------------------------------------
 def initialize_firebase_credentials():
     global credentials
-    if credentials is not None:
+
+    if credentials:
         return
 
     try:
-        # Get the JSON string from Render environment variable
-        service_account_json = os.getenv("SERVICE_ACCOUNT_KEY")
+        if not SERVICE_ACCOUNT_KEY:
+            raise Exception("SERVICE_ACCOUNT_KEY missing in Render environment.")
 
-        if not service_account_json:
-            raise Exception("SERVICE_ACCOUNT_KEY environment variable is missing.")
+        info = json.loads(SERVICE_ACCOUNT_KEY)
 
-        # Parse the JSON string
-        service_account_info = json.loads(service_account_json)
-
-        # Create credentials from JSON dict
         credentials = service_account.Credentials.from_service_account_info(
-            service_account_info,
-            scopes=SCOPES
+            info, scopes=SCOPES
         )
 
-        print("Firebase Credentials Initialized from environment variable.")
+        print("Firebase Credentials Loaded.")
 
     except Exception as e:
-        print(f"FATAL: Could not load Service Account Key from environment variable: {e}")
+        print(f"FATAL Firebase Cred Error: {e}")
 
-def get_oauth2_access_token() -> str:
+
+# ----------------------------------------
+# OAUTH TOKEN
+# ----------------------------------------
+def get_oauth2_access_token():
     global credentials
 
     if credentials is None:
         initialize_firebase_credentials()
-        if credentials is None:
-            raise Exception("Firebase credentials not available.")
 
     try:
         if not credentials.token or credentials.expired:
-            request = GoogleAuthRequest()
-            credentials.refresh(request)
+            credentials.refresh(GoogleAuthRequest())
 
         return credentials.token
 
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Token refresh failed: {e}"
-        )
+        raise HTTPException(status_code=500, detail=f"Token Error: {e}")
 
-# --------------------------------------------------------------------------
-# Firebase Fetch
-# --------------------------------------------------------------------------
 
+# ----------------------------------------
+# GET LANGUAGE PREFERENCE
+# ----------------------------------------
 def get_language_preference(user_id: str) -> str:
     try:
         token = get_oauth2_access_token()
     except:
         return "en"
 
-    url = f"{FIREBASE_DATABASE_URL}/Users/{user_id}/farmDetails/preferredLanguage.json"
-    params = {"access_token": token}
+    # FIXED path: correct location for preferredLanguage
+    url = f"{FIREBASE_DATABASE_URL}/Users/{user_id}/preferredLanguage.json"
 
     try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()
+        res = requests.get(url, params={"access_token": token})
+        res.raise_for_status()
 
-        lang = response.json()
+        lang = res.json()
         if isinstance(lang, str):
-            lang = lang.lower().strip()
+            lang = lang.lower()
             return lang if lang in ["en", "kn"] else "en"
 
         return "en"
@@ -130,99 +127,77 @@ def get_language_preference(user_id: str) -> str:
     except:
         return "en"
 
-# --------------------------------------------------------------------------
-# System Prompt
-# --------------------------------------------------------------------------
 
-def get_krishi_sakhi_prompt(language: str) -> str:
-    lang_name = "Kannada" if language == "kn" else "English"
+# ----------------------------------------
+# SYSTEM PROMPT
+# ----------------------------------------
+def get_prompt(language: str):
+    lang = "Kannada" if language == "kn" else "English"
+
     return f"""
-    You are 'KrishiSakhi', an agricultural expert for Karnataka.
+You are KrishiSakhi, a Karnataka agriculture assistant.
 
-    Always respond ONLY in {lang_name}.
+Rules:
+1. ALWAYS reply ONLY in {lang}.
+2. Provide guidance on: Paddy, Ragi, Sugarcane, Cotton, Turmeric.
+3. Follow IPM for pest management.
+4. If schemes are mentioned → add disclaimer to verify with local officers.
+5. Keep responses simple, helpful, farmer-friendly.
+"""
 
-    Crop focus: Paddy, Ragi, Sugarcane, Turmeric, Cotton.
 
-    If a pest/disease is mentioned, always include:
-    A) Identification
-    B) IPM/Non-chemical first steps
-    C) When to consult Krishi Adhikari
-
-    For schemes: Add disclaimer to verify locally.
-
-    For off-topic questions:
-    Reply in Kannada: "ನಾನು ಕೃಷಿ ಸಂಬಂಧಿತ ವಿಷಯಗಳಿಗೆ ಮಾತ್ರ ಸಹಾಯ ಮಾಡಬಲ್ಲೆ."
-    """
-
-# --------------------------------------------------------------------------
-# 4. Chat Endpoint
-# --------------------------------------------------------------------------
-
+# ----------------------------------------
+# CHAT ENDPOINT
+# ----------------------------------------
 @app.post("/chat/send", response_model=ChatResponse)
 async def chat_with_gemini(query: ChatQuery):
 
     if client is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="AI service not initialized."
-        )
+        raise HTTPException(503, "Gemini client not initialized.")
 
-    language_code = get_language_preference(query.user_id)
-    session_id = f"{query.user_id}-{language_code}"
+    language = get_language_preference(query.user_id)
+    session_key = f"{query.user_id}-{language}"
 
-    # ----------------------------------------
-    # CREATE NEW CHAT SESSION
-    # ----------------------------------------
-    if session_id not in active_chats:
+    # CREATE NEW SESSION
+    if session_key not in active_chats:
+
         try:
-            system_prompt = get_krishi_sakhi_prompt(language_code)
-            config = types.GenerateContentConfig(system_instruction=system_prompt)
+            prompt = get_prompt(language)
 
-            # *** FIXED LINE ***
-            chat = client.chat(model="gemini-2.5-flash", config=config)
+            config = types.GenerateContentConfig(system_instruction=prompt)
 
-            active_chats[session_id] = chat
+            # FIXED: correct way to start chat session
+            chat = client.chats.create(model="gemini-2.5-flash", config=config)
+
+            active_chats[session_key] = chat
 
             if query.user_query == "INITIAL_LOAD":
-                welcome = (
-                    "ನಾನು ಈಗ ನಿಮ್ಮ ಆದ್ಯತೆಯ ಭಾಷೆಯಲ್ಲಿ (ಕನ್ನಡದಲ್ಲಿ) ಉತ್ತರಿಸಲು ಸಿದ್ಧ."
-                    if language_code == "kn"
-                    else "I am ready to respond in English."
-                )
-                return ChatResponse(session_id=session_id, response_text=welcome, language=language_code)
+                welcome = "ನಾನು ಕನ್ನಡದಲ್ಲಿ ಉತ್ತರಿಸಲಿದ್ದೇನೆ." if language == "kn" else "I will answer in English."
+                return ChatResponse(session_id=session_key, response_text=welcome, language=language)
 
         except Exception as e:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Session Creation Error: {e}"
-            )
+            raise HTTPException(500, f"Session Error: {e}")
 
-    chat = active_chats[session_id]
+    chat = active_chats[session_key]
 
-    # ----------------------------------------
     # SEND MESSAGE
-    # ----------------------------------------
     try:
-        reply = chat.send_message(query.user_query)
+        response = chat.send_message(query.user_query)
+
         return ChatResponse(
-            session_id=session_id,
-            response_text=reply.text,
-            language=language_code
+            session_id=session_key,
+            response_text=response.text,
+            language=language
         )
 
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Gemini API Error: {e}"
-        )
+        raise HTTPException(500, f"Gemini Error: {e}")
 
-# --------------------------------------------------------------------------
-# 5. Startup
-# --------------------------------------------------------------------------
 
+# ----------------------------------------
+# STARTUP
+# ----------------------------------------
 @app.on_event("startup")
 def startup_event():
     initialize_firebase_credentials()
     initialize_gemini_client()
-
-
