@@ -1,9 +1,5 @@
-# main.py — KS Chatbot Backend (FastAPI + Ollama LLaMA + Firebase)
-# Rewritten to use local Ollama (llama3.1:8b) and offline TTS (pyttsx3).
-# Preserves all original modules and logic from your uploaded file. :contentReference[oaicite:1]{index=1}
-# NOTE: Put your large dictionaries in JSON files under ./data/ (see README below)
-# or paste them into the placeholders below.
-
+# main.py — KS Chatbot Backend (FastAPI + Groq LLaMA3 + Firebase)
+# Fully merged replacement using Groq (llama3-8b-8192). Keep SERVICE_ACCOUNT_KEY in env.
 import os
 import json
 import requests
@@ -16,30 +12,27 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import re
 import difflib
-from collections import defaultdict, Counter
+from collections import defaultdict
 import uuid
-import subprocess
 import logging
-from groq import Groq
-import os
 
+# Optional Groq SDK import - if you have installed groq client
+try:
+    from groq import Groq
+except Exception:
+    Groq = None  # fallback; we'll handle missing client at runtime
 
 # -----------------------------
-# Logging
+# Logging & env
 # -----------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ks-backend")
 
-# -----------------------------
-# Load environment
-# -----------------------------
 load_dotenv()
 
-# Ollama local endpoint
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")  # llama3.1:8b
-
-# Firebase + other keys (keep service account admin flow)
+# Core env vars
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")
 FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "").rstrip("/")
 SERVICE_ACCOUNT_KEY = os.getenv("SERVICE_ACCOUNT_KEY")
 OPENWEATHER_KEY = os.getenv("OPENWEATHER_KEY")
@@ -47,47 +40,32 @@ OPENWEATHER_KEY = os.getenv("OPENWEATHER_KEY")
 if not FIREBASE_DATABASE_URL:
     raise Exception("FIREBASE_DATABASE_URL missing in environment")
 
-def initialize_groq():
-    global client
-    try:
-        api_key = os.getenv("GROQ_API_KEY")
-        if not api_key:
-            print("GROQ_API_KEY missing in environment variables!")
-            client = None
-            return
-        client = Groq(api_key=api_key)
-        print("Groq LLaMA3 client initialized.")
-    except Exception as e:
-        print("Groq init error:", e)
-        client = None
-
-# -----------------------------
 # Globals
-# -----------------------------
 SCOPES = [
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/firebase.database"
 ]
-
 credentials = None
-app = FastAPI(title="KS Chatbot Backend (Ollama)", version="4.0")
+client = None  # Groq client object
+app = FastAPI(title="KS Chatbot Backend (Groq)", version="4.0")
 
 # Ensure directories
 os.makedirs("tts_audio", exist_ok=True)
+os.makedirs("data", exist_ok=True)
+
 try:
     from fastapi.staticfiles import StaticFiles
     app.mount("/tts", StaticFiles(directory="tts_audio"), name="tts")
 except Exception:
-    logger.warning("fastapi.staticfiles not available; /tts mount skipped")
+    logger.warning("StaticFiles not available; /tts mount skipped")
 
 # =========================================================
-# MODELS
+# Pydantic Models
 # =========================================================
 class ChatQuery(BaseModel):
     user_id: str
     user_query: str
     session_id: Optional[str] = None
-
 
 class ChatResponse(BaseModel):
     session_id: str
@@ -99,53 +77,45 @@ class ChatResponse(BaseModel):
     metadata: Optional[Dict[str, Any]]
 
 # =========================================================
-# TTS: offline using pyttsx3 (default). For Kannada, system voices might be needed.
-# If pyttsx3 not available or Kannada voice missing, it will fallback to gTTS (online).
+# TTS offline (pyttsx3) with gTTS fallback
 # =========================================================
 def generate_tts_audio(text: str, lang: str):
-    """
-    Generate TTS audio file and return local URL path (served under /tts).
-    Offline default: pyttsx3 (system TTS). Fallback: gTTS (requires internet).
-    Note: Kannada voice depends on OS TTS voices installed.
-    """
     filename = f"tts_{uuid.uuid4()}.mp3"
     filepath = os.path.join("tts_audio", filename)
 
-    # Try pyttsx3 offline TTS
+    # Try pyttsx3 offline
     try:
         import pyttsx3
         engine = pyttsx3.init()
-        # Try to pick a voice for Kannada if requested
         if lang == "kn":
-            # attempt to find a Kannada voice
-            voices = engine.getProperty('voices')
+            # try to pick Kannada voice if present
+            voices = engine.getProperty("voices")
             kn_voice = None
             for v in voices:
-                if "kn" in getattr(v, "id", "").lower() or "kann" in getattr(v, "name", "").lower():
+                vid = getattr(v, "id", "") or getattr(v, "name", "")
+                if "kn" in vid.lower() or "kann" in vid.lower():
                     kn_voice = v.id
                     break
             if kn_voice:
-                engine.setProperty('voice', kn_voice)
-            # else use default voice (may not speak Kannada correctly)
-
+                engine.setProperty("voice", kn_voice)
         engine.save_to_file(text, filepath)
         engine.runAndWait()
         return f"/tts/{filename}"
     except Exception as e:
-        logger.warning("pyttsx3 TTS failed or not present: %s", e)
+        logger.warning("pyttsx3 TTS failed: %s", e)
 
-    # Fallback to gTTS online (if available); keeps compatibility with your previous flow.
+    # Fallback to gTTS online
     try:
         from gtts import gTTS
         tts = gTTS(text=text, lang="kn" if lang == "kn" else "en")
         tts.save(filepath)
         return f"/tts/{filename}"
     except Exception as e:
-        logger.error("Both offline and fallback online TTS failed: %s", e)
+        logger.error("gTTS fallback failed: %s", e)
         return None
 
 # =========================================================
-# Firebase admin initialization (keep your admin token flow)
+# Firebase admin initialization + helpers
 # =========================================================
 def initialize_firebase_credentials():
     global credentials
@@ -173,9 +143,6 @@ def get_firebase_token() -> str:
         logger.exception("Token refresh failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Token refresh failed: {e}")
 
-# =========================================================
-# Firebase helper (unchanged)
-# =========================================================
 def firebase_get(path: str):
     try:
         token = get_firebase_token()
@@ -201,138 +168,40 @@ def get_user_location(user_id: str):
     farm = get_user_farm_details(user_id)
     if not farm:
         return None
-    return {
-        "district": farm.get("district"),
-        "taluk": farm.get("taluk")
-    }
+    return {"district": farm.get("district"), "taluk": farm.get("taluk")}
 
 # =========================================================
-# Ollama LLaMA wrapper — local call to Ollama generate API.
-# Uses a detailed/descriptive system prompt for KrishiSakhi.
+# Groq client initialization
 # =========================================================
-def llama_generate(system_prompt: str, user_prompt: str, max_tokens: int = 512) -> str:
-    """
-    Send request to local Ollama API to generate a response.
-    Ollama endpoint (default): http://localhost:11434/api/generate
-    Model: OLLAMA_MODEL (default: 'llama3.1')
-    """
-    payload = {
-        "model": OLLAMA_MODEL,
-        # Build a short "chat-like" prompt combining system + user
-        "prompt": f"System: {system_prompt}\n\nUser: {user_prompt}\n\nAssistant:",
-        "max_tokens": max_tokens,
-        "temperature": 0.2,
-        "top_p": 0.95
-    }
-    try:
-        r = requests.post(OLLAMA_URL, json=payload, timeout=60)
-        r.raise_for_status()
-        data = r.json()
-        # Ollama returns generated text in a few possible shapes. We try common ones:
-        # 1) { "choices": [ { "message": {"content": "..." } } ] }
-        # 2) { "text": "..." }
-        # 3) { "response": "..." }
-        if isinstance(data, dict):
-            if "choices" in data and isinstance(data["choices"], list):
-                ch = data["choices"][0]
-                # handle message shape
-                if isinstance(ch, dict) and "message" in ch and isinstance(ch["message"], dict):
-                    return ch["message"].get("content", "") or ""
-                if isinstance(ch, dict) and "text" in ch:
-                    return ch.get("text", "")
-            if "text" in data:
-                return data.get("text", "")
-            if "response" in data:
-                return data.get("response", "")
-            # Last fallback: join any 'outputs' text
-            if "outputs" in data and isinstance(data["outputs"], list):
-                texts = []
-                for out in data["outputs"]:
-                    if isinstance(out, dict):
-                        texts.append(out.get("content") or out.get("text") or "")
-                    elif isinstance(out, str):
-                        texts.append(out)
-                return "\n".join([t for t in texts if t])
-        # If none matched, return raw text
-        return str(data)
-    except Exception as e:
-        logger.exception("Ollama generation failed: %s", e)
-        return f"AI generation error: {e}"
-
-# =========================================================
-# System prompt builder
-# =========================================================
-def get_prompt(lang: str) -> str:
-    if lang == "kn":
-        return ("ನೀವು KrishiSakhi ಹೀಗೆ ವರ್ತಿಸಬೇಕು: ಕನ್ನಡದಲ್ಲಿಯೇ ಸಣ್ಣ, ಸ್ಪಷ್ಟ ಮತ್ತು ವಿವರಣಾತ್ಮಕ ಕೃಷಿ ಸಲಹೆಗಳು ನೀಡಿ. "
-                "ಹಂತ-ನಿರ್ದಿಷ್ಟ ಕ್ರಮಗಳು, ದೋಸೇಜ್ ಗಳಾದರೆ ಮೌಲ್ಯಗಳನ್ನು ಕುಳಿತಾಗಿ ನೀಡಿ. ಸಂಕ್ಷಿಪ್ತವಾಗಿ, ಆದರೆ ನಿರ್ದಿಷ್ಟವಾಗಿ — "
-                "ಉಪಯುಕ್ತ, ಭದ್ರ ಮತ್ತು ಕಾರ್ಯಮುಖ್ಯ.")
-    else:
-        # Detailed + Descriptive style
-        return ("You are KrishiSakhi — a concise but detailed agricultural assistant. "
-                "Always respond in short paragraphs with clear ACTIONABLE steps, followed by 1–2 lines of explanation. "
-                "Use metric units. When recommending doses, provide ranges or example calculations. "
-                "Be conservative and advise soil test when in doubt.")
-
-# =========================================================
-# crop_advisory using Ollama; session handling simplified
-# =========================================================
-active_chats: Dict[str, Dict[str, Any]] = {}
-
-def crop_advisory(user_id: str, query: str, lang: str, session_key: str):
-    """
-    Generates detailed + descriptive crop advisory using Groq LLaMA3.
-    """
+def initialize_groq():
     global client
-
-    if not client:
-        return "AI is not available. GROQ_API_KEY missing or invalid.", False, [], session_key
-
-    # Detailed + descriptive system prompt
-    system_prompt = (
-        "You are KrishiSakhi, an agriculture expert. "
-        "Respond ONLY in Kannada if lang='kn', otherwise English. "
-        "Your answers must be:\n"
-        "- Detailed and descriptive\n"
-        "- Scientifically accurate\n"
-        "- Actionable for farmers\n"
-        "- Cover reasons and explanations\n"
-        "Do NOT refuse questions. Provide best possible guidance."
-    )
-
-    # Prepare messages for Groq chat model
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": query}
-    ]
-
     try:
-        response = client.chat.completions.create(
-            model="llama3-8b-8192",
-            messages=messages,
-            max_tokens=500,
-            temperature=0.6
-        )
-        ai_text = response.choices[0].message["content"]
-
-        return ai_text, False, ["Crop stage", "Pest check", "Soil test"], session_key
-
+        if not GROQ_API_KEY:
+            logger.warning("GROQ_API_KEY missing; Groq disabled.")
+            client = None
+            return
+        if Groq is None:
+            # try dynamic import if not available earlier
+            try:
+                from groq import Groq as _Groq
+                client = _Groq(api_key=GROQ_API_KEY)
+            except Exception as e:
+                logger.exception("groq library not installed or import failed: %s", e)
+                client = None
+        else:
+            client = Groq(api_key=GROQ_API_KEY)
+        logger.info("Groq client initialized.")
     except Exception as e:
-        return f"AI generation error: {str(e)}", False, [], session_key
-
+        logger.exception("Groq init error: %s", e)
+        client = None
 
 # =========================================================
-# The rest of the domain-specific modules are preserved largely as in your uploaded file.
-# For brevity I re-use the same helper functions and data structures — load large dicts either
-# from data/*.json files (recommended) or paste them into this script manually.
+# Load large constants from data/ks_constants.json (optional)
 # =========================================================
-
-# --- Attempt to load big constants from ./data/constants.json (optional) ---
 DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
 constants_path = os.path.join(DATA_DIR, "ks_constants.json")
 
-# default placeholders (will be replaced by your real dicts)
+# default small placeholders
 STAGE_RECOMMENDATIONS = {}
 FERTILIZER_BASE = {}
 PESTICIDE_DB = {}
@@ -349,7 +218,6 @@ PRICE_LIST = {
     "banana": 12, "turmeric": 120, "cotton": 40, "sugarcane": 3
 }
 
-# If user provided a JSON of constants, load them
 if os.path.exists(constants_path):
     try:
         with open(constants_path, "r", encoding="utf-8") as fh:
@@ -368,64 +236,128 @@ if os.path.exists(constants_path):
             PRICE_LIST = data.get("PRICE_LIST", PRICE_LIST)
             logger.info("Loaded constants from %s", constants_path)
     except Exception as e:
-        logger.exception("Failed to load constants JSON: %s", e)
-        # continue; user can paste dictionaries manually into script.
+        logger.exception("Failed loading constants: %s", e)
 
-# If constants are still empty, attempt to import from the original uploaded file (main.txt) by reading it.
-# This is a convenience: it parses the uploaded file for top-level dict assignments (best-effort).
+# Best-effort extraction from uploaded file if present (/mnt/data/main.txt)
 UPLOADED_FILE = "/mnt/data/main.txt"
 if os.path.exists(UPLOADED_FILE):
     try:
-        # read text and attempt to exec specific dict blocks inside a safe namespace
         txt = open(UPLOADED_FILE, "r", encoding="utf-8").read()
-        # Extract big dicts using regex — best-effort; only do this if we didn't already load constants
+        # attempt to exec safe literal dicts (best-effort; only if unpopulated)
         if not STAGE_RECOMMENDATIONS:
-            m = re.search(r"STAGE_RECOMMENDATIONS\s*=\s*({.*?^})\s*\n\n", txt, re.S | re.M)
+            m = re.search(r"STAGE_RECOMMENDATIONS\s*=\s*({[\s\S]*?^\})\s*$", txt, re.M)
             if m:
                 STAGE_RECOMMENDATIONS = eval(m.group(1))
         if not FERTILIZER_BASE:
-            m = re.search(r"FERTILIZER_BASE\s*=\s*({.*?^})\s*\n\n", txt, re.S | re.M)
+            m = re.search(r"FERTILIZER_BASE\s*=\s*({[\s\S]*?^\})\s*$", txt, re.M)
             if m:
                 FERTILIZER_BASE = eval(m.group(1))
         if not PESTICIDE_DB:
-            m = re.search(r"PESTICIDE_DB\s*=\s*({.*?^})\s*\n\n", txt, re.S | re.M)
+            m = re.search(r"PESTICIDE_DB\s*=\s*({[\s\S]*?^\})\s*$", txt, re.M)
             if m:
                 PESTICIDE_DB = eval(m.group(1))
-        if not CROP_ET_BASE:
-            m = re.search(r"CROP_ET_BASE\s*=\s*({.*?^})\s*\n\n", txt, re.S | re.M)
-            if m:
-                CROP_ET_BASE = eval(m.group(1))
-        logger.info("Attempted to extract large dicts from uploaded file (best-effort).")
+        logger.info("Attempted to extract constants from uploaded file (best-effort).")
     except Exception as e:
-        logger.warning("Could not auto-extract constants from uploaded file: %s", e)
-        # It's safe — user can put constants in data/ks_constants.json or paste them below.
+        logger.warning("Auto-extraction from uploaded file failed: %s", e)
 
-# ---------------------------------------------------------
-# If STAGE_RECOMMENDATIONS etc are empty, the user must
-# provide them (either paste into this file or create
-# data/ks_constants.json). This script continues and will
-# still operate for functions that do not rely on those dicts.
-# ---------------------------------------------------------
-
-# For the remainder of the modules we reuse your original logic,
-# but rewritten as functions referencing the variables loaded above.
-# (To keep this message manageable I will implement all helper
-# functions and the router while assuming constants are present.)
 # =========================================================
+# Helper modules (soil center, weather, market, pest/disease, timeline)
+# These functions reuse logic from your original script.
+# =========================================================
+def soil_testing_center(user_id: str, language: str):
+    loc = get_user_location(user_id)
+    if not loc:
+        msg = {
+            "en": "Farm location not found. Update district & taluk in farmDetails.",
+            "kn": "ಫಾರಂ ಸ್ಥಳದ ಮಾಹಿತಿ ಕಂಡುಬರಲಿಲ್ಲ. farmDetails ನಲ್ಲಿ ಜಿಲ್ಲೆ ಮತ್ತು ತಾಲೂಕು ನವೀಕರಿಸಿ."
+        }
+        return msg[language], True, ["Update farm details"]
+    district, taluk = loc["district"], loc["taluk"]
+    centers = firebase_get(f"SoilTestingCenters/Karnataka/{district}/{taluk}")
+    if not centers:
+        return ("No soil test center found for your area.", True, ["Update farm details"])
+    for _, info in centers.items():
+        if isinstance(info, dict):
+            text = f"{info.get('name')}\n{info.get('address')}\nContact: {info.get('contact')}"
+            return text, True, ["Directions", "Call center"]
+    return "No center data available.", True, []
 
-# Helper: stage recommendation engine
+def weather_advice(language: str):
+    advice = {
+        "en": "Check forecast. If rain expected, delay irrigation. Mulching helps retain moisture.",
+        "kn": "ಹವಾಮान ವರದಿ ನೋಡಿ. ಮಳೆ ಸಂಭವಿಸಿದರೆ ನೀರಾವರಿ ತಡೆಯಿರಿ. ಮಲ್ಚಿಂಗ್ ಮಣ್ಣು ತೇವಾವಸ್ಥೆ ಉಳಿಸುತ್ತದೆ."
+    }
+    return advice[language], True, ["Irrigation schedule", "Mulching"]
+
+def market_price(query: str, language: str):
+    q = query.lower()
+    for crop, price in PRICE_LIST.items():
+        if crop in q:
+            if language == "kn":
+                return f"{crop.title()} ಸರಾಸರಿ ಬೆಲೆ: ₹{price}/ಕಿ.ಗ್ರಾಂ. ಸ್ಥಳೀಯ APMC ಪರಿಶೀಲಿಸಿ.", False, ["Sell at APMC", "Quality Check"]
+            return f"Approx price for {crop.title()}: ₹{price}/kg. Verify with local APMC.", False, ["Sell at APMC", "Quality Check"]
+    fallback = {"en": "Please specify the crop name (e.g., 'chilli price').", "kn": "ದಯವಿಟ್ಟು ಬೆಳೆ ಹೆಸರು ನೀಡಿ (ಉದಾ: 'ಮೆಣಸಿನ ಬೆಲೆ')."}
+    return fallback[language], False, ["Chilli price", "Areca price"]
+
+def pest_disease(query: str, language: str):
+    q = query.lower()
+    if "curl" in q:
+        en = ("Symptoms indicate leaf curl virus or sucking pests. Remove severely affected shoots and apply neem oil spray.")
+        kn = ("ಎಲೆ ಕರ್ಭಟ ವೈರಸ್ ಅಥವಾ ಸ್ಯಕ್ಕಿಂಗ್ ಕೀಟಗಳ ಸೂಚನೆ. ಗಂಭೀರವಾದ ಭಾಗಗಳನ್ನು ತೆಗೆದುಹಾಕಿ ಮತ್ತು ನೀಮ್ ಎಣ್ಣೆ ಸಿಂಪಡಿಸಿ.")
+        return (kn if language == "kn" else en), True, ["Neem spray", "Contact Krishi Adhikari"]
+    if "yellow" in q or "yellowing" in q:
+        en = "Yellowing leaves may indicate nutrient deficiency or overwatering. Check soil moisture and consider soil test."
+        kn = "ಎಲೆಗಳು ಹಳದಿ ಆಗುವುದು ಪೋಷಕಾಂಶ ಕೊರತೆ ಅಥವಾ ಹೆಚ್ಚಾಗಿ ನೀರು."
+        return (kn if language == "kn" else en), True, ["Soil test", "Nitrogen application"]
+    fallback = {"en": "Provide more symptom details or upload a photo.", "kn": "ಲಕ್ಷಣಗಳ ಬಗ್ಗೆ ಹೆಚ್ಚಿನ ವಿವರ ನೀಡಿ ಅಥವಾ ಫೋಟೋ ಅಪ್ಲೋಡ್ ಮಾಡಿ."}
+    return fallback[language], True, ["Upload photo"]
+
+def farm_timeline(user_id: str, language: str):
+    logs = firebase_get(f"Users/{user_id}/farmActivityLogs")
+    if not logs:
+        return ("No activity logs found." if language == "en" else "ಚಟುವಟಿಕೆ ಲಾಗ್ ಕಂಡುಬರಲಿಲ್ಲ."), False, ["Add activity"]
+    summaries = []
+    for crop, entries in logs.items():
+        if isinstance(entries, dict):
+            latest_entry = None
+            latest_ts = -1
+            for act_id, data in entries.items():
+                ts = data.get("timestamp", 0)
+                if ts and ts > latest_ts:
+                    latest_ts = ts
+                    latest_entry = data
+            if latest_entry:
+                crop_name = latest_entry.get("cropName", crop)
+                act = latest_entry.get("subActivity", "")
+                stage = latest_entry.get("stage", "")
+                if language == "kn":
+                    summaries.append(f"{crop_name}: ಇತಿಚ್ಚಿನ ಚಟುವಟಿಕೆ {act} (ಹಂತ: {stage})")
+                else:
+                    summaries.append(f"{crop_name}: latest activity {act} (stage: {stage})")
+    if not summaries:
+        return ("No recent activities found." if language == "en" else "ಯಾವುದೇ ಇತ್ತೀಚಿನ ಚಟುವಟಿಕೆಗಳು ಇಲ್ಲ."), False, ["Add activity"]
+    return ("\n".join(summaries), False, ["View full timeline"])
+
+# =========================================================
+# Stage recommendation engine (placeholder lookup)
+# =========================================================
 def stage_recommendation_engine(crop_name: str, stage: str, lang: str) -> str:
     crop = (crop_name or "").lower()
     st = (stage or "").lower()
     if crop in STAGE_RECOMMENDATIONS and st in STAGE_RECOMMENDATIONS[crop]:
-        return STAGE_RECOMMENDATIONS[crop][st][lang]
+        val = STAGE_RECOMMENDATIONS[crop][st]
+        if isinstance(val, dict):
+            return val.get(lang, val.get("en", ""))
+        return val
     fallback = {
         "en": f"No specific recommendation for {crop_name} at stage '{stage}'.",
         "kn": f"{crop_name} ಹಂತ '{stage}' ಗೆ ವಿಶೇಷ ಸಲಹೆ ಲಭ್ಯವಿಲ್ಲ."
     }
     return fallback[lang]
 
+# =========================================================
 # Fertilizer calculator
+# =========================================================
 def fertilizer_calculator(crop: str, stage: str, user_id: str, lang: str) -> Tuple[str, bool, List[str]]:
     farm = get_user_farm_details(user_id)
     area_ha = None
@@ -435,10 +367,8 @@ def fertilizer_calculator(crop: str, stage: str, user_id: str, lang: str) -> Tup
         area_ha = float(area_ha) if area_ha is not None else 1.0
     except Exception:
         area_ha = 1.0
-
     crop_l = (crop or "").lower()
     stage_l = (stage or "").lower()
-
     if crop_l in FERTILIZER_BASE and stage_l in FERTILIZER_BASE[crop_l]:
         N_per_ha, P_per_ha, K_per_ha = FERTILIZER_BASE[crop_l][stage_l]
         N = round(N_per_ha * area_ha, 2)
@@ -458,21 +388,32 @@ def fertilizer_calculator(crop: str, stage: str, user_id: str, lang: str) -> Tup
         }
         return fallback[lang], False, ["Soil test"]
 
-# Pesticide recommendation wrapper
+# =========================================================
+# Pesticide recommendation
+# =========================================================
 def pesticide_recommendation(crop: str, pest: str, lang: str) -> Tuple[str, bool, List[str]]:
     pest_l = (pest or "").lower()
     if pest_l in PESTICIDE_DB:
-        return PESTICIDE_DB[pest_l][lang if lang in ["en", "kn"] else "en"], False, ["Use bio-pesticide", "Contact advisor"]
+        rec = PESTICIDE_DB[pest_l].get(lang if lang in ["en", "kn"] else "en")
+        if rec:
+            return rec, False, ["Use bio-pesticide", "Contact advisor"]
     for key in PESTICIDE_DB.keys():
         if key in pest_l:
-            return PESTICIDE_DB[key][lang if lang in ["en", "kn"] else "en"], False, ["Use bio-pesticide", "Contact advisor"]
+            rec = PESTICIDE_DB[key].get(lang if lang in ["en", "kn"] else "en")
+            if rec:
+                return rec, False, ["Use bio-pesticide", "Contact advisor"]
     fallback = {
         "en": "Pest not recognized. Provide photo or pest name (e.g., 'aphid', 'fruit borer').",
         "kn": "ಕೀಟ ಗುರುತಿಸಲಲಾಗಲಿಲ್ಲ. ಫೋಟೋ ಅಥವಾ ಕೀಟದ ಹೆಸರು ನೀಡಿ (ಉದಾ: aphid)."
     }
     return fallback[lang], False, ["Upload photo", "Contact Krishi Adhikari"]
 
-# Weather & irrigation helpers (partial replication)
+# =========================================================
+# Weather & irrigation & yield modules (kept similar)
+# =========================================================
+SOIL_WATER_HOLDING = {"sandy": 0.6, "loamy": 1.0, "clay": 1.2}
+CROP_ET_BASE = CROP_ET_BASE or {}  # may be filled in constants
+
 def get_mock_weather_for_district(district):
     return {"temp": 30, "humidity": 70, "wind": 8, "rain_next_24h_mm": 0}
 
@@ -503,7 +444,6 @@ def weather_suggestion_engine(weather, crop_stage=None, language="en"):
     wind = weather.get("wind", 8)
     rain = weather.get("rain", 0)
     cond = weather.get("condition", "")
-
     suggestions = []
     if temp > 35:
         suggestions.append("High heat – give afternoon irrigation and mulch.")
@@ -546,7 +486,7 @@ def translate_weather_suggestions_kn(sugs):
 def weather_advisory(user_id: str, language: str):
     farm = get_user_farm_details(user_id)
     if not farm or "district" not in farm:
-        msg = {"en": "Farm district missing. Update farm details.", "kn": "ಫಾರಂ ಜಿಲ್ಲೆಯ ಮಾಹಿತಿ ಇಲ್ಲ. farmDetails ನವೀಕರಿಸಿ."}
+        msg = {"en": "Farm district missing. Update farm details.", "kn": "ಫಾರಂregelendistrict missing."}
         return msg[language], [], False
     district = farm["district"]
     weather = fetch_weather_by_location(district)
@@ -569,7 +509,6 @@ def weather_advisory(user_id: str, language: str):
                   f"Rain (1h): {weather['rain']} mm\n")
     return report, suggestions, True
 
-# Irrigation schedule (similar to your original)
 def irrigation_schedule(crop: str, stage: str, user_id: str, lang: str) -> Tuple[str, bool, List[str]]:
     farm = get_user_farm_details(user_id)
     soil = (farm.get("soilType") or "loamy").lower()
@@ -583,8 +522,8 @@ def irrigation_schedule(crop: str, stage: str, user_id: str, lang: str) -> Tuple
     weather = get_mock_weather_for_district(district)
     rain_next_24 = weather.get("rain_next_24h_mm", 0)
     crop_l = (crop or "").lower()
-    base_et = CROP_ET_BASE.get(crop_l, 4)  # mm/day default
-    soil_factor = {"sandy":0.6,"loamy":1.0,"clay":1.2}.get(soil,1.0)
+    base_et = CROP_ET_BASE.get(crop_l, 4)
+    soil_factor = SOIL_WATER_HOLDING.get(soil, 1.0)
     stage_mult = 1.0
     if "nursery" in (stage or "").lower() or "vegetative" in (stage or "").lower():
         stage_mult = 1.2
@@ -604,7 +543,6 @@ def irrigation_schedule(crop: str, stage: str, user_id: str, lang: str) -> Tuple
         text = (f"Recommendation for {crop.title()} ({stage}): approx {round(required_mm,1)} mm/day irrigation (~{total_liters} liters/day for {area_ha} ha).")
     return text, False, ["Soil moisture sensor", "Irrigation logs"]
 
-# Yield prediction (simple heuristic)
 def yield_prediction(crop: str, user_id: str, lang: str) -> Tuple[str, bool, List[str]]:
     farm = get_user_farm_details(user_id)
     area_ha = 1.0
@@ -643,7 +581,9 @@ def yield_prediction(crop: str, user_id: str, lang: str) -> Tuple[str, bool, Lis
                 f"(Factors: fertilizer_ok={fert_ok}, irrigation_ok={irrigation_ok}, pest_ok={pest_control_ok})")
     return text, False, ["Improve irrigation", "Soil test", "Pest control"]
 
-# Symptom diagnosis (simplified wrapper using your original diagnose_advanced)
+# =========================================================
+# Symptom recognition & diagnosis (as before)
+# =========================================================
 def _normalize_text(text: str) -> str:
     text = text.lower().strip()
     text = re.sub(r"[^a-z0-9\s/-]", " ", text)
@@ -671,7 +611,6 @@ def _extract_symptom_keys(user_text: str, fuzzy_threshold: float = 0.6):
                 found.append(key)
         except Exception:
             pass
-    # n-gram matching
     n = len(tokens)
     for L in range(2, min(6, n+1)):
         for i in range(n - L + 1):
@@ -756,7 +695,8 @@ def diagnose_advanced(user_text: str, user_crop: Optional[str] = None, lang: str
     return final_text, False, suggestions
 
 # =========================================================
-# weather_crop_fusion
+# Weather + crop fusion
+# =========================================================
 def weather_crop_fusion(user_id: str, crop: str, stage: str, lang: str):
     farm = get_user_farm_details(user_id)
     district = farm.get("district", "unknown")
@@ -784,10 +724,85 @@ def weather_crop_fusion(user_id: str, crop: str, stage: str, lang: str):
     return report, False, ["Fertilizer", "Pest Check", "Irrigation"]
 
 # =========================================================
-# Router
+# Groq-based crop_advisory (Detailed + Descriptive)
+# =========================================================
+def get_prompt(lang: str) -> str:
+    if lang == "kn":
+        return ("ನೀವು KrishiSakhi ಹೀಗೆ ವರ್ತಿಸಬೇಕು: ಕನ್ನಡದಲ್ಲಿಯೇ ವಿವರಣಾತ್ಮಕ ಕೃಷಿ ಸಲಹೆಗಳು ನೀಡಿ. "
+                "ಹಂತ-ನಿರ್ದಿಷ್ಟ ಕ್ರಮಗಳು, ಡೋಸೇಜ್ ಸಾಮಾನ್ಯ ಮೌಲ್ಯಗಳು ಒದಗಿಸಿ. ಕಾರ್ಯನಿರ್ದೇಶನ ಮತ್ತು ಕಾರಣಗಳನ್ನು ನೀಡಿರಿ.")
+    else:
+        return ("You are KrishiSakhi — an agricultural assistant. Provide detailed and descriptive advice: "
+                "1) Actionable steps (bulleted), 2) brief explanation with reasons. Use metric units. Prefer conservative guidance and advise soil tests when unsure.")
+
+def crop_advisory(user_id: str, query: str, lang: str, session_key: str):
+    global client
+    if not client:
+        return "AI is not available (GROQ_API_KEY missing or Groq init failed).", False, [], session_key
+
+    sys_prompt = get_prompt(lang)
+    farm = get_user_farm_details(user_id) or {}
+    farm_summary = ""
+    if farm:
+        farm_summary = "Farm details: " + ", ".join(f"{k}={v}" for k, v in farm.items() if k in ["district", "soilType", "areaInHectares"]) + "."
+    user_prompt = f"{farm_summary}\nUser query: {query}\nPlease respond with short bulleted actionable steps followed by 1-2 lines of explanation."
+
+    # Build messages for Groq chat model
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+
+    try:
+        # Groq client API: client.chat.completions.create(...)
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            max_tokens=600,
+            temperature=0.3
+        )
+        # Extract content robustly
+        ai_text = ""
+        try:
+            ai_text = response.choices[0].message["content"]
+        except Exception:
+            # fallback shapes
+            if isinstance(response, dict):
+                ai_text = response.get("text") or response.get("response") or str(response)
+            else:
+                ai_text = str(response)
+        return ai_text, False, ["Crop stage", "Pest check", "Soil test"], session_key
+    except Exception as e:
+        logger.exception("Groq generation failed: %s", e)
+        return f"AI generation error: {e}", False, [], session_key
+
+# =========================================================
+# get_latest_crop_stage (uses farmActivityLogs)
+# =========================================================
+def get_latest_crop_stage(user_id: str, lang: str):
+    logs = firebase_get(f"Users/{user_id}/farmActivityLogs")
+    if not logs:
+        return ("No farm activity found." if lang == "en" else "ಫಾರಂ ಚಟುವಟಿಕೆ ಕಂಡುಬರಲಿಲ್ಲ."), False, ["Add activity"]
+    latest_ts = -1
+    latest_crop = None
+    latest_stage = None
+    for crop, entries in logs.items():
+        if isinstance(entries, dict):
+            for act_id, data in entries.items():
+                ts = data.get("timestamp", 0)
+                if ts and ts > latest_ts:
+                    latest_ts = ts
+                    latest_crop = data.get("cropName", crop)
+                    latest_stage = data.get("stage", "Unknown")
+    rec = stage_recommendation_engine(latest_crop, latest_stage, lang)
+    header = (f"{latest_crop} ಬೆಳೆ ಪ್ರಸ್ತುತ ಹಂತ: {latest_stage}\n\n" if lang == "kn" else f"Current stage of {latest_crop}: {latest_stage}\n\n")
+    return header + rec, False, ["Next actions", "Fertilizer advice", "Pest check"]
+
+# =========================================================
+# Router — intent detection & calls
 # =========================================================
 def route(query: str, user_id: str, lang: str, session_key: str):
     q = query.lower().strip()
+
     if any(tok in q for tok in ["soil test", "soil testing", "soil centre", "soil center"]):
         return {"response_text": soil_testing_center(user_id, lang)[0], "voice": True, "suggestions": ["Update farm details"]}
 
@@ -800,31 +815,18 @@ def route(query: str, user_id: str, lang: str, session_key: str):
         return {"response_text": report, "voice": voice, "suggestions": sug}
 
     if any(tok in q for tok in ["price", "market", "mandi"]):
-        # market price
-        t = None
-        for crop, price in PRICE_LIST.items():
-            if crop in q:
-                if lang == "kn":
-                    t = f"{crop.title()} ಸರಾಸರಿ ಬೆಲೆ: ₹{price}/ಕಿ.ಗ್ರಾಂ. ಸ್ಥಳೀಯ APMC ಪರಿಶೀಲಿಸಿ."
-                else:
-                    t = f"Approx price for {crop.title()}: ₹{price}/kg. Verify with local APMC."
-                break
-        if not t:
-            fallback = {"en": "Please specify the crop name (e.g., 'chilli price').", "kn": "ದಯವಿಟ್ಟು ಬೆಳೆ ಹೆಸರು ನೀಡಿ (ಉದಾ: 'ಮೆಣಸಿನ ಬೆಲೆ')."}
-            t = fallback[lang]
-        return {"response_text": t, "voice": False, "suggestions": ["Chilli price", "Areca price"]}
+        t, v, s = market_price(query, lang)
+        return {"response_text": t, "voice": v, "suggestions": s}
 
     if "crop stage" in q or q == "stage" or "stage" in q:
         t, v, s = get_latest_crop_stage(user_id, lang)
         return {"response_text": t, "voice": v, "suggestions": s}
 
     if any(tok in q for tok in ["pest", "disease", "leaf", "spots", "yellowing", "curl", "blight", "fungus"]):
-        # advanced symptom diagnosis uses diagnose_advanced
         diag_text, voice, sugg = diagnose_advanced(query, user_crop=None, lang=lang)
         return {"response_text": diag_text, "voice": voice, "suggestions": sugg}
 
     if "fertilizer" in q or "fertiliser" in q or "apply fertilizer" in q:
-        # attempt to find latest crop/stage from activity logs
         logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
         latest_crop = None; latest_stage = None; latest_ts = -1
         if isinstance(logs, dict):
@@ -837,7 +839,7 @@ def route(query: str, user_id: str, lang: str, session_key: str):
                             latest_crop = data.get("cropName", crop)
                             latest_stage = data.get("stage", "")
         if not latest_crop:
-            msg = ("Please provide the crop and stage (e.g., 'fertilizer for paddy tillering')" if lang == "en" else "ದಯವിട്ട് ಬೆಳೆ ಮತ್ತು ಹಂತವನ್ನು ನೀಡಿ (ಉದಾ: 'fertilizer for paddy tillering')")
+            msg = ("Please provide the crop and stage (e.g., 'fertilizer for paddy tillering')" if lang == "en" else "ದಯವಿಟ್ಟು ಬೆಳೆ ಮತ್ತು ಹಂತವನ್ನು ನೀಡಿ (ಉದಾ: 'fertilizer for paddy tillering')")
             return {"response_text": msg, "voice": False, "suggestions": ["Provide crop & stage"]}
         t, v, s = fertilizer_calculator(latest_crop, latest_stage, user_id, lang)
         return {"response_text": t, "voice": v, "suggestions": s}
@@ -911,29 +913,9 @@ def route(query: str, user_id: str, lang: str, session_key: str):
         text, v, s = weather_crop_fusion(user_id, latest_crop, latest_stage, lang)
         return {"response_text": text, "voice": v, "suggestions": s}
 
-    # Default: use Ollama crop_advisory
+    # Default → Groq crop_advisory
     t, v, s, sid = crop_advisory(user_id, query, lang, session_key)
     return {"response_text": t, "voice": v, "suggestions": s, "session_id": sid}
-
-# get_latest_crop_stage implementation (uses farmActivityLogs)
-def get_latest_crop_stage(user_id: str, lang: str):
-    logs = firebase_get(f"Users/{user_id}/farmActivityLogs")
-    if not logs:
-        return ("No farm activity found." if lang == "en" else "ಫಾರಂ ಚಟುವಟಿಕೆ ಕಂಡುಬರಲಿಲ್ಲ."), False, ["Add activity"]
-    latest_ts = -1
-    latest_crop = None
-    latest_stage = None
-    for crop, entries in logs.items():
-        if isinstance(entries, dict):
-            for act_id, data in entries.items():
-                ts = data.get("timestamp", 0)
-                if ts and ts > latest_ts:
-                    latest_ts = ts
-                    latest_crop = data.get("cropName", crop)
-                    latest_stage = data.get("stage", "Unknown")
-    rec = stage_recommendation_engine(latest_crop, latest_stage, lang)
-    header = (f"{latest_crop} ಬೆಳೆ ಪ್ರಸ್ತುತ ಹಂತ: {latest_stage}\n\n" if lang == "kn" else f"Current stage of {latest_crop}: {latest_stage}\n\n")
-    return header + rec, False, ["Next actions", "Fertilizer advice", "Pest check"]
 
 # =========================================================
 # API endpoint
@@ -973,48 +955,39 @@ async def chat_send(payload: ChatQuery):
 # =========================================================
 @app.on_event("startup")
 def startup():
-    initialize_firebase_credentials()
-    initialize_groq()
-
+    try:
+        initialize_firebase_credentials()
+    except Exception as e:
+        logger.warning("Firebase init failed at startup: %s", e)
+    try:
+        initialize_groq()
+    except Exception as e:
+        logger.warning("Groq init failed: %s", e)
+    logger.info("KS Chatbot backend (Groq) started.")
 
 # =========================================================
-# README (instructions)
+# If executed directly, print small README
 # =========================================================
-README = """
-KS Chatbot Backend (Ollama) — quick start
+if __name__ == "__main__":
+    print("""
+KS Chatbot Backend (Groq) — quick start
 ----------------------------------------
+1) Install requirements:
+   pip install fastapi uvicorn requests python-dotenv pyttsx3 gTTS google-auth groq
 
-1) Requirements
-   - Python 3.10+
-   - pip install -r requirements.txt
-     (requirements: fastapi, uvicorn, requests, python-dotenv, pyttsx3, pydantic, google-auth, google-auth-oauthlib)
-   - Ollama installed and running locally with your chosen model, e.g.:
-       ollama pull llama3.1
-       ollama run llama3.1
-     The default API endpoint used in this script: http://localhost:11434/api/generate
-     Adjust OLLAMA_URL and OLLAMA_MODEL via env vars if different.
-
-2) Environment variables (.env)
+2) Environment variables:
    FIREBASE_DATABASE_URL=https://your-project.firebaseio.com
-   SERVICE_ACCOUNT_KEY='{"type": "...", ... }'   # full service account JSON as one-line string
-   OPENWEATHER_KEY=your_openweather_key   # optional (weather features)
-   OLLAMA_URL=http://localhost:11434/api/generate
-   OLLAMA_MODEL=llama3.1
+   SERVICE_ACCOUNT_KEY='{"type": "...", ... }'   # entire service account JSON string
+   GROQ_API_KEY=your_groq_api_key
+   OPENWEATHER_KEY=optional
 
-3) Large dictionaries (STAGE_RECOMMENDATIONS, FERTILIZER_BASE, ...)
-   - You can place them in data/ks_constants.json with keys matching the variable names,
-     e.g. { "STAGE_RECOMMENDATIONS": { ... }, "FERTILIZER_BASE": { ... }, ... }
-   - OR paste them manually into this script where the placeholders are defined.
+3) Place large dicts in data/ks_constants.json (optional) with keys:
+   STAGE_RECOMMENDATIONS, FERTILIZER_BASE, PESTICIDE_DB, etc.
 
-4) Run
+4) Run:
    uvicorn main:app --host 0.0.0.0 --port 8000
 
 Notes:
- - TTS uses pyttsx3 (offline). Kannada voice availability depends on OS voices.
- - Ollama must be running and the model pulled before hitting /chat/send. If Ollama fails, the API will return a helpful error.
- - This file was produced from your uploaded file (main.txt). :contentReference[oaicite:2]{index=2}
-"""
-
-if __name__ == "__main__":
-    print(README)
-
+ - Render: add FIREBASE_DATABASE_URL, SERVICE_ACCOUNT_KEY, GROQ_API_KEY in Environment.
+ - If Groq client import fails, ensure 'groq' SDK is installed or use HTTP wrappers to Groq API.
+""")
