@@ -28,7 +28,7 @@ load_dotenv()
 FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "").rstrip("/")
 SERVICE_ACCOUNT_KEY = os.getenv("SERVICE_ACCOUNT_KEY")  # JSON string
 OPENWEATHER_KEY = os.getenv("OPENWEATHER_KEY")
-HUGGINGFACE_API_KEY = os.getenv("HF_API_KEY")  # Hugging Face API key (router)
+HF_API_KEY = os.getenv("HF_API_KEY")  # Hugging Face API key (router)
 HF_MODEL = os.getenv("HF_MODEL", "mistralai/Mixtral-8x7B-Instruct-v0.1")  # default Mixtral instruct
 TTS_DIR = os.getenv("TTS_DIR", "tts_audio")
 
@@ -851,4 +851,5 @@ def health():
     return {"status":"ok", "time": datetime.utcnow().isoformat(), "hf": bool(HF_API_KEY), "gtts": GTTS_AVAILABLE}
 
 # End of file
+
 
