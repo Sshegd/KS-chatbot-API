@@ -20,6 +20,9 @@ from collections import defaultdict, Counter
 import uuid
 import subprocess
 import logging
+from groq import Groq
+import os
+
 
 # -----------------------------
 # Logging
@@ -43,6 +46,20 @@ OPENWEATHER_KEY = os.getenv("OPENWEATHER_KEY")
 
 if not FIREBASE_DATABASE_URL:
     raise Exception("FIREBASE_DATABASE_URL missing in environment")
+
+def initialize_groq():
+    global client
+    try:
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            print("GROQ_API_KEY missing in environment variables!")
+            client = None
+            return
+        client = Groq(api_key=api_key)
+        print("Groq LLaMA3 client initialized.")
+    except Exception as e:
+        print("Groq init error:", e)
+        client = None
 
 # -----------------------------
 # Globals
@@ -263,18 +280,46 @@ def get_prompt(lang: str) -> str:
 active_chats: Dict[str, Dict[str, Any]] = {}
 
 def crop_advisory(user_id: str, query: str, lang: str, session_key: str):
-    # Use system prompt to enforce 'Detailed + Descriptive' style
-    sys_prompt = get_prompt(lang)
-    # Optionally include user farm summary in the prompt to make output personalized
-    farm = get_user_farm_details(user_id) or {}
-    farm_summary = ""
-    if farm:
-        farm_summary = "Farm details: " + ", ".join(f"{k}={v}" for k, v in farm.items() if k in ["district", "soilType", "areaInHectares"]) + "."
-    user_prompt = (f"{farm_summary}\nUser query: {query}\nPlease give short actionable advice (1-4 bullets) followed by 1-2 lines explanation.")
-    text = llama_generate(sys_prompt, user_prompt, max_tokens=512)
-    # suggestions
-    suggestions = ["Crop stage", "Pest check", "Soil test"]
-    return text, False, suggestions, session_key
+    """
+    Generates detailed + descriptive crop advisory using Groq LLaMA3.
+    """
+    global client
+
+    if not client:
+        return "AI is not available. GROQ_API_KEY missing or invalid.", False, [], session_key
+
+    # Detailed + descriptive system prompt
+    system_prompt = (
+        "You are KrishiSakhi, an agriculture expert. "
+        "Respond ONLY in Kannada if lang='kn', otherwise English. "
+        "Your answers must be:\n"
+        "- Detailed and descriptive\n"
+        "- Scientifically accurate\n"
+        "- Actionable for farmers\n"
+        "- Cover reasons and explanations\n"
+        "Do NOT refuse questions. Provide best possible guidance."
+    )
+
+    # Prepare messages for Groq chat model
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": query}
+    ]
+
+    try:
+        response = client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=messages,
+            max_tokens=500,
+            temperature=0.6
+        )
+        ai_text = response.choices[0].message["content"]
+
+        return ai_text, False, ["Crop stage", "Pest check", "Soil test"], session_key
+
+    except Exception as e:
+        return f"AI generation error: {str(e)}", False, [], session_key
+
 
 # =========================================================
 # The rest of the domain-specific modules are preserved largely as in your uploaded file.
@@ -928,11 +973,9 @@ async def chat_send(payload: ChatQuery):
 # =========================================================
 @app.on_event("startup")
 def startup():
-    try:
-        initialize_firebase_credentials()
-    except Exception as e:
-        logger.warning("Firebase init failed at startup: %s", e)
-    logger.info("KS Chatbot backend (Ollama) started. Ollama endpoint: %s model: %s", OLLAMA_URL, OLLAMA_MODEL)
+    initialize_firebase_credentials()
+    initialize_groq()
+
 
 # =========================================================
 # README (instructions)
@@ -974,3 +1017,4 @@ Notes:
 
 if __name__ == "__main__":
     print(README)
+
