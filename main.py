@@ -1,5 +1,6 @@
-# main.py — KS Chatbot Backend (FastAPI + Groq LLaMA3 + Firebase)
-# Fully merged replacement using Groq (llama3-8b-8192). Keep SERVICE_ACCOUNT_KEY in env.
+# main.py — KS Chatbot Backend (FastAPI + Groq HTTP + Firebase)
+# Uses Groq via raw HTTPS calls to https://api.groq.com/openai/v1/chat/completions
+# No 'groq' Python package required.
 import os
 import json
 import requests
@@ -16,12 +17,6 @@ from collections import defaultdict
 import uuid
 import logging
 
-# Optional Groq SDK import - if you have installed groq client
-try:
-    from groq import Groq
-except Exception:
-    Groq = None  # fallback; we'll handle missing client at runtime
-
 # -----------------------------
 # Logging & env
 # -----------------------------
@@ -32,7 +27,8 @@ load_dotenv()
 
 # Core env vars
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")  # model on Groq
+GROQ_URL = os.getenv("GROQ_URL", "https://api.groq.com/openai/v1/chat/completions")
 FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "").rstrip("/")
 SERVICE_ACCOUNT_KEY = os.getenv("SERVICE_ACCOUNT_KEY")
 OPENWEATHER_KEY = os.getenv("OPENWEATHER_KEY")
@@ -46,8 +42,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/firebase.database"
 ]
 credentials = None
-client = None  # Groq client object
-app = FastAPI(title="KS Chatbot Backend (Groq)", version="4.0")
+app = FastAPI(title="KS Chatbot Backend (Groq HTTP)", version="4.0")
 
 # Ensure directories
 os.makedirs("tts_audio", exist_ok=True)
@@ -171,29 +166,61 @@ def get_user_location(user_id: str):
     return {"district": farm.get("district"), "taluk": farm.get("taluk")}
 
 # =========================================================
-# Groq client initialization
+# Groq HTTP helper (no SDK)
 # =========================================================
-def initialize_groq():
-    global client
+def groq_chat_request(system_prompt: str, user_prompt: str, max_tokens: int = 600, temperature: float = 0.3) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """
+    Call Groq OpenAI-compatible Chat Completions endpoint via HTTPS.
+    Returns (text, raw_response_dict_or_none)
+    """
+    if not GROQ_API_KEY:
+        return "AI unavailable: GROQ_API_KEY not set.", None
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "max_tokens": max_tokens,
+        "temperature": temperature
+    }
+
     try:
-        if not GROQ_API_KEY:
-            logger.warning("GROQ_API_KEY missing; Groq disabled.")
-            client = None
-            return
-        if Groq is None:
-            # try dynamic import if not available earlier
-            try:
-                from groq import Groq as _Groq
-                client = _Groq(api_key=GROQ_API_KEY)
-            except Exception as e:
-                logger.exception("groq library not installed or import failed: %s", e)
-                client = None
-        else:
-            client = Groq(api_key=GROQ_API_KEY)
-        logger.info("Groq client initialized.")
+        r = requests.post(GROQ_URL, json=payload, headers=headers, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        # Typical OpenAI shape: data["choices"][0]["message"]["content"]
+        if isinstance(data, dict):
+            choices = data.get("choices")
+            if isinstance(choices, list) and len(choices) > 0:
+                first = choices[0]
+                # handle different shapes
+                if isinstance(first, dict):
+                    # openai-like
+                    msg = first.get("message") or first.get("delta") or first
+                    if isinstance(msg, dict):
+                        content = msg.get("content") or msg.get("text") or None
+                        if content:
+                            return content, data
+                    # direct text
+                    txt = first.get("text") or first.get("content")
+                    if txt:
+                        return txt, data
+            # fallback to possible 'text' or 'response' fields
+            if "text" in data:
+                return data["text"], data
+            if "response" in data:
+                return data["response"], data
+        return (str(data), data)
     except Exception as e:
-        logger.exception("Groq init error: %s", e)
-        client = None
+        logger.exception("Groq HTTP request failed: %s", e)
+        return (f"AI generation error: {e}", None)
 
 # =========================================================
 # Load large constants from data/ks_constants.json (optional)
@@ -201,7 +228,7 @@ def initialize_groq():
 DATA_DIR = "data"
 constants_path = os.path.join(DATA_DIR, "ks_constants.json")
 
-# default small placeholders
+# default placeholders (user should provide full dicts)
 STAGE_RECOMMENDATIONS = {}
 FERTILIZER_BASE = {}
 PESTICIDE_DB = {}
@@ -243,7 +270,6 @@ UPLOADED_FILE = "/mnt/data/main.txt"
 if os.path.exists(UPLOADED_FILE):
     try:
         txt = open(UPLOADED_FILE, "r", encoding="utf-8").read()
-        # attempt to exec safe literal dicts (best-effort; only if unpopulated)
         if not STAGE_RECOMMENDATIONS:
             m = re.search(r"STAGE_RECOMMENDATIONS\s*=\s*({[\s\S]*?^\})\s*$", txt, re.M)
             if m:
@@ -261,8 +287,7 @@ if os.path.exists(UPLOADED_FILE):
         logger.warning("Auto-extraction from uploaded file failed: %s", e)
 
 # =========================================================
-# Helper modules (soil center, weather, market, pest/disease, timeline)
-# These functions reuse logic from your original script.
+# Domain-specific helpers (soil center, weather, market, pest/disease, timeline)
 # =========================================================
 def soil_testing_center(user_id: str, language: str):
     loc = get_user_location(user_id)
@@ -285,7 +310,7 @@ def soil_testing_center(user_id: str, language: str):
 def weather_advice(language: str):
     advice = {
         "en": "Check forecast. If rain expected, delay irrigation. Mulching helps retain moisture.",
-        "kn": "ಹವಾಮान ವರದಿ ನೋಡಿ. ಮಳೆ ಸಂಭವಿಸಿದರೆ ನೀರಾವರಿ ತಡೆಯಿರಿ. ಮಲ್ಚಿಂಗ್ ಮಣ್ಣು ತೇವಾವಸ್ಥೆ ಉಳಿಸುತ್ತದೆ."
+        "kn": "ಹವಾಮಾನ ವರದಿ ನೋಡಿ. ಮಳೆ ಸಂಭವಿಸಿದರೆ ನೀರಾವರಿ ತಡೆಯಿರಿ. ಮಲ್ಚಿಂಗ್ ಮಣ್ಣು ತೇವಾವಸ್ಥೆ ಉಳಿಸುತ್ತದೆ."
     }
     return advice[language], True, ["Irrigation schedule", "Mulching"]
 
@@ -339,7 +364,7 @@ def farm_timeline(user_id: str, language: str):
     return ("\n".join(summaries), False, ["View full timeline"])
 
 # =========================================================
-# Stage recommendation engine (placeholder lookup)
+# Stage recommendation engine
 # =========================================================
 def stage_recommendation_engine(crop_name: str, stage: str, lang: str) -> str:
     crop = (crop_name or "").lower()
@@ -409,10 +434,10 @@ def pesticide_recommendation(crop: str, pest: str, lang: str) -> Tuple[str, bool
     return fallback[lang], False, ["Upload photo", "Contact Krishi Adhikari"]
 
 # =========================================================
-# Weather & irrigation & yield modules (kept similar)
+# Weather, irrigation and yield modules (kept similar)
 # =========================================================
 SOIL_WATER_HOLDING = {"sandy": 0.6, "loamy": 1.0, "clay": 1.2}
-CROP_ET_BASE = CROP_ET_BASE or {}  # may be filled in constants
+CROP_ET_BASE = CROP_ET_BASE or {}
 
 def get_mock_weather_for_district(district):
     return {"temp": 30, "humidity": 70, "wind": 8, "rain_next_24h_mm": 0}
@@ -486,7 +511,7 @@ def translate_weather_suggestions_kn(sugs):
 def weather_advisory(user_id: str, language: str):
     farm = get_user_farm_details(user_id)
     if not farm or "district" not in farm:
-        msg = {"en": "Farm district missing. Update farm details.", "kn": "ಫಾರಂregelendistrict missing."}
+        msg = {"en": "Farm district missing. Update farm details.", "kn": "ಫಾರಂ ಜಿಲ್ಲೆಯ ಮಾಹಿತಿ ಇಲ್ಲ. farmDetails ನವೀಕರಿಸಿ."}
         return msg[language], [], False
     district = farm["district"]
     weather = fetch_weather_by_location(district)
@@ -582,7 +607,7 @@ def yield_prediction(crop: str, user_id: str, lang: str) -> Tuple[str, bool, Lis
     return text, False, ["Improve irrigation", "Soil test", "Pest control"]
 
 # =========================================================
-# Symptom recognition & diagnosis (as before)
+# Symptom recognition & diagnosis
 # =========================================================
 def _normalize_text(text: str) -> str:
     text = text.lower().strip()
@@ -707,7 +732,7 @@ def weather_crop_fusion(user_id: str, crop: str, stage: str, lang: str):
     fusion = weather_suggestion_engine(weather, crop_stage=stage, language=lang)
     if lang == "kn":
         report = (
-            f"{district} ಹವಾಮಾನ:\n"
+            f"{district} ಹवಾಮಾನ:\n"
             f"ತಾಪಮಾನ: {weather['temp']}°C | ತೇವಾಂಶ: {weather['humidity']}%\n"
             f"ಹಂತ: {crop} – {stage}\n\n"
             f"ಹಂತ ಸಲಹೆ:\n{stage_advice}\n\n"
@@ -724,7 +749,7 @@ def weather_crop_fusion(user_id: str, crop: str, stage: str, lang: str):
     return report, False, ["Fertilizer", "Pest Check", "Irrigation"]
 
 # =========================================================
-# Groq-based crop_advisory (Detailed + Descriptive)
+# Groq-backed crop_advisory (detailed + descriptive)
 # =========================================================
 def get_prompt(lang: str) -> str:
     if lang == "kn":
@@ -735,10 +760,6 @@ def get_prompt(lang: str) -> str:
                 "1) Actionable steps (bulleted), 2) brief explanation with reasons. Use metric units. Prefer conservative guidance and advise soil tests when unsure.")
 
 def crop_advisory(user_id: str, query: str, lang: str, session_key: str):
-    global client
-    if not client:
-        return "AI is not available (GROQ_API_KEY missing or Groq init failed).", False, [], session_key
-
     sys_prompt = get_prompt(lang)
     farm = get_user_farm_details(user_id) or {}
     farm_summary = ""
@@ -746,37 +767,11 @@ def crop_advisory(user_id: str, query: str, lang: str, session_key: str):
         farm_summary = "Farm details: " + ", ".join(f"{k}={v}" for k, v in farm.items() if k in ["district", "soilType", "areaInHectares"]) + "."
     user_prompt = f"{farm_summary}\nUser query: {query}\nPlease respond with short bulleted actionable steps followed by 1-2 lines of explanation."
 
-    # Build messages for Groq chat model
-    messages = [
-        {"role": "system", "content": sys_prompt},
-        {"role": "user", "content": user_prompt}
-    ]
-
-    try:
-        # Groq client API: client.chat.completions.create(...)
-        response = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            max_tokens=600,
-            temperature=0.3
-        )
-        # Extract content robustly
-        ai_text = ""
-        try:
-            ai_text = response.choices[0].message["content"]
-        except Exception:
-            # fallback shapes
-            if isinstance(response, dict):
-                ai_text = response.get("text") or response.get("response") or str(response)
-            else:
-                ai_text = str(response)
-        return ai_text, False, ["Crop stage", "Pest check", "Soil test"], session_key
-    except Exception as e:
-        logger.exception("Groq generation failed: %s", e)
-        return f"AI generation error: {e}", False, [], session_key
+    text, raw = groq_chat_request(sys_prompt, user_prompt, max_tokens=600, temperature=0.3)
+    return text, False, ["Crop stage", "Pest check", "Soil test"], session_key
 
 # =========================================================
-# get_latest_crop_stage (uses farmActivityLogs)
+# get_latest_crop_stage
 # =========================================================
 def get_latest_crop_stage(user_id: str, lang: str):
     logs = firebase_get(f"Users/{user_id}/farmActivityLogs")
@@ -959,35 +954,33 @@ def startup():
         initialize_firebase_credentials()
     except Exception as e:
         logger.warning("Firebase init failed at startup: %s", e)
-    try:
-        initialize_groq()
-    except Exception as e:
-        logger.warning("Groq init failed: %s", e)
-    logger.info("KS Chatbot backend (Groq) started.")
+    logger.info("KS Chatbot backend (Groq HTTP) started. Ensure GROQ_API_KEY is set in env.")
 
 # =========================================================
-# If executed directly, print small README
+# If executed directly, print short README
 # =========================================================
 if __name__ == "__main__":
     print("""
-KS Chatbot Backend (Groq) — quick start
+KS Chatbot Backend (Groq HTTP) — quick start
 ----------------------------------------
 1) Install requirements:
-   pip install fastapi uvicorn requests python-dotenv pyttsx3 gTTS google-auth groq
+   pip install fastapi uvicorn requests python-dotenv pyttsx3 gTTS google-auth
 
-2) Environment variables:
-   FIREBASE_DATABASE_URL=https://your-project.firebaseio.com
-   SERVICE_ACCOUNT_KEY='{"type": "...", ... }'   # entire service account JSON string
-   GROQ_API_KEY=your_groq_api_key
-   OPENWEATHER_KEY=optional
+   Note: 'groq' Python package is NOT required; HTTP calls are used.
 
-3) Place large dicts in data/ks_constants.json (optional) with keys:
-   STAGE_RECOMMENDATIONS, FERTILIZER_BASE, PESTICIDE_DB, etc.
+2) Environment variables (Render):
+   FIREBASE_DATABASE_URL = https://your-project.firebaseio.com
+   SERVICE_ACCOUNT_KEY = '{"type": "...", ... }'   # whole JSON as single-line string
+   GROQ_API_KEY = your_groq_api_key
+   OPENWEATHER_KEY = optional (if you want weather)
 
-4) Run:
+3) Optionally place big dicts in data/ks_constants.json:
+   { "STAGE_RECOMMENDATIONS": {...}, "FERTILIZER_BASE": {...}, ... }
+
+4) Run locally:
    uvicorn main:app --host 0.0.0.0 --port 8000
 
 Notes:
- - Render: add FIREBASE_DATABASE_URL, SERVICE_ACCOUNT_KEY, GROQ_API_KEY in Environment.
- - If Groq client import fails, ensure 'groq' SDK is installed or use HTTP wrappers to Groq API.
+ - On Render, add FIREBASE_DATABASE_URL, SERVICE_ACCOUNT_KEY and GROQ_API_KEY in Environment.
+ - This file uses pure HTTPS to Groq; no groq SDK needed.
 """)
