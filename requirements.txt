@@ -7,4 +7,5 @@ requests
 google-auth-oauthlib
 google-auth-httplib2
 gtts==2.5.1
+groq
 
