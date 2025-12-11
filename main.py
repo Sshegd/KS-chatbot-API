@@ -11,11 +11,14 @@
 
 import os
 import json
+import uuid
 import requests
+import logging
 from typing import List, Optional, Dict, Any, Tuple
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from google import genai
+from gtts import gTTS
 from google.genai import types
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request as GoogleAuthRequest
@@ -40,6 +43,17 @@ OPENWEATHER_KEY = os.getenv("OPENWEATHER_KEY")
 if not FIREBASE_DATABASE_URL:
     raise Exception("FIREBASE_DATABASE_URL missing")
 
+# ensure tts directory exists BEFORE mounting StaticFiles
+TTS_DIR = os.path.join(os.getcwd(), "tts_audio")
+os.makedirs(TTS_DIR, exist_ok=True)
+
+# -----------------------------
+# Logging
+# -----------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ks-backend")
+
+
 # -----------------------------
 # Globals
 # -----------------------------
@@ -49,12 +63,12 @@ SCOPES = [
 ]
 
 credentials = None
-client = None
+gemini_client = None
 active_chats: Dict[str, Any] = {}
 
 app = FastAPI(title="KS Chatbot Backend", version="4.0")
-os.makedirs("tts_audio", exist_ok=True)
-app.mount("/tts", StaticFiles(directory="tts_audio"), name="tts")
+
+app.mount("/tts", StaticFiles(directory=TTS_DIR), name="tts")
 
 
 
@@ -76,60 +90,97 @@ class ChatResponse(BaseModel):
     audio_url: Optional[str] = None
     metadata: Optional[Dict[str, Any]]
 
-def generate_tts_audio(text: str, lang: str):
-    # You can use Google TTS, gTTS or Gemini TTS (if enabled)
-    from gtts import gTTS
-    import uuid
 
-    filename = f"tts_{uuid.uuid4()}.mp3"
-    filepath = f"./tts_audio/{filename}"
+def load_service_account_from_env(value: str):
+    """
+    Accept either:
+      - full JSON string in SERVICE_ACCOUNT_KEY env var
+      - a path to a JSON file
+    """
+    if not value:
+        raise ValueError("SERVICE_ACCOUNT_KEY not provided")
+
+    # if it looks like a path and file exists, read it
+    if os.path.isfile(value):
+        with open(value, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    # else try to parse as JSON string
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as e:
+        raise ValueError("SERVICE_ACCOUNT_KEY is not a valid path or JSON string") from e
+    
+# =========================================================
+# TTS generation (gTTS)
+# =========================================================
+
+def generate_tts_audio(text: str, lang: str = "en") -> Optional[str]:
+    """
+    Generates an MP3 in ./tts_audio and returns the relative URL path (/tts/<filename>).
+    Requires gTTS to be installed. Falls back to None on error.
+    """
+    if gTTS is None:
+        logger.warning("gTTS not installed; skipping TTS generation.")
+        return None
 
     try:
-        tts = gTTS(text=text, lang="kn" if lang == "kn" else "en")
-        tts.save(filepath)
+        # choose language code — support 'kn' (kannada) if required; gTTS supports 'kn'
+        tts_lang = "kn" if lang == "kn" else "en"
+        filename = f"tts_{uuid.uuid4().hex}.mp3"
+        filepath = os.path.join(TTS_DIR, filename)
+        t = gTTS(text=text, lang=tts_lang)
+        t.save(filepath)
+        logger.info("Saved TTS file: %s", filepath)
+        # return the mounted path (StaticFiles serves from /tts)
         return f"/tts/{filename}"
     except Exception as e:
-        print("TTS error:", e)
+        logger.exception("TTS generation error: %s", e)
         return None
+
 
 # =========================================================
 # Initialization helpers (Gemini + Firebase)
 # =========================================================
-def initialize_gemini():
-    global client
-    try:
-        if GEMINI_API_KEY:
-            client = genai.Client(api_key=GEMINI_API_KEY)
-            print("Gemini initialized.")
-        else:
-            print("GEMINI_API_KEY not set; Gemini disabled.")
-    except Exception as e:
-        print("Gemini init error:", e)
+
 
 
 def initialize_firebase_credentials():
     global credentials
     if credentials:
         return
+    if not SERVICE_ACCOUNT_KEY:
+        raise Exception("SERVICE_ACCOUNT_KEY missing in environment")
+
     try:
-        info = json.loads(SERVICE_ACCOUNT_KEY)
-        credentials = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-        print("Firebase service account loaded.")
+        info = load_service_account_from_env(SERVICE_ACCOUNT_KEY)
+        credentials_obj = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+        credentials = credentials_obj
+        logger.info("Loaded Firebase service account credentials.")
     except Exception as e:
-        print("Cannot load Firebase credentials:", e)
+        logger.exception("Cannot load Firebase credentials: %s", e)
         raise
 
 
 def get_firebase_token() -> str:
+    """
+    Refreshes and returns an OAuth2 access token for the service account.
+    Used to call Firebase Realtime Database REST API with access_token param.
+    """
     global credentials
     if not credentials:
         initialize_firebase_credentials()
-
     try:
-        if not credentials.token or credentials.expired:
+        if not credentials.valid:
             credentials.refresh(GoogleAuthRequest())
-        return credentials.token
+        token = credentials.token
+        if not token:
+            # attempt refresh
+            credentials.refresh(GoogleAuthRequest())
+            token = credentials.token
+        return token
     except Exception as e:
+        logger.exception("Token refresh failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Token refresh failed: {e}")
 
 
@@ -148,17 +199,42 @@ def firebase_get(path: str):
         return None
 
 
-# convenience fetchers
+# Convenience wrappers
 def get_language(user_id: str) -> str:
-    lang = firebase_get(f"Users/{user_id}/preferredLanguage")
-    if isinstance(lang, str) and lang.lower() == "kn":
-        return "kn"
+    try:
+        ln = firebase_get(f"Users/{user_id}/preferredLanguage")
+        if isinstance(ln, str) and ln.lower().startswith("kn"):
+            return "kn"
+    except Exception:
+        pass
     return "en"
 
 
 def get_user_farm_details(user_id: str) -> Dict[str, Any]:
     data = firebase_get(f"Users/{user_id}/farmDetails")
     return data if isinstance(data, dict) else {}
+
+# Helper to get latest crop & stage from farmActivityLogs defensively
+def get_latest_crop_and_stage(user_id: str) -> Tuple[Optional[str], Optional[str]]:
+    logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
+    if not isinstance(logs, dict):
+        return None, None
+    latest_ts = -1
+    latest_crop = None
+    latest_stage = None
+    for crop_key, entries in logs.items():
+        if not isinstance(entries, dict):
+            continue
+        for act_id, data in entries.items():
+            try:
+                ts = int(data.get("timestamp", 0) or 0)
+            except Exception:
+                ts = 0
+            if ts and ts > latest_ts:
+                latest_ts = ts
+                latest_crop = data.get("cropName") or crop_key
+                latest_stage = data.get("stage", "Unknown")
+    return latest_crop, latest_stage
     
 def get_user_location(user_id: str):
     farm = get_user_farm_details(user_id)
@@ -168,6 +244,24 @@ def get_user_location(user_id: str):
         "district": farm.get("district"),
         "taluk": farm.get("taluk")
     }
+# =========================================================
+# Gemini (GenAI) initialization — safe wrapper
+# =========================================================
+def initialize_gemini():
+    global gemini_client
+    try:
+        if not GEMINI_API_KEY:
+            logger.info("GEMINI_API_KEY not set; Gemini disabled.")
+            return
+        if genai is None:
+            logger.warning("google-genai SDK not installed; Gemini disabled.")
+            return
+        # Create client
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        logger.info("Initialized Gemini client.")
+    except Exception as e:
+        logger.exception("Gemini init error: %s", e)
+        gemini_client = None
 
 
 
@@ -1295,11 +1389,10 @@ def fertilizer_calculator(crop: str, stage: str, user_id: str, lang: str) -> Tup
     area_ha = None
     # farmDetails may store area as 'area' (hectares) or 'areaInHectares'; be defensive
     if isinstance(farm, dict):
-        area_ha = farm.get("areaInHectares") or farm.get("area") or farm.get("landSizeHectares")
-    try:
-        area_ha = float(area_ha) if area_ha is not None else 1.0
-    except Exception:
-        area_ha = 1.0
+        try:
+            area_ha = farm.get("areaInHectares") or farm.get("area") or farm.get("landSizeHectares")
+        except Exception:
+            area_ha = 1.0
 
     crop_l = (crop or "").lower()
     stage_l = (stage or "").lower()
@@ -1316,12 +1409,12 @@ def fertilizer_calculator(crop: str, stage: str, user_id: str, lang: str) -> Tup
             text = (f"Fertilizer recommendation for {crop.title()} ({stage.title()}) for {area_ha} ha:\n"
                     f"N: {N} kg, P2O5: {P} kg, K2O: {K} kg.\nAdjust based on soil test results.")
         return text, False, ["Soil test", "Buy fertilizer"]
-    else:
-        fallback = {
-            "en": "No fertilizer template available for this crop/stage. Provide crop and stage or run soil test.",
-            "kn": "ಈ ಬೆಳೆ/ಹಂತಕ್ಕೆ ಎರೆ ಖರೀದಿಗಾಗಿ ರೂಪರೆಖೆ ಲಭ್ಯವಿಲ್ಲ. ದಯವಿಟ್ಟು ಮಣ್ಣು ಪರೀಕ್ಷೆ ಮಾಡಿ."
-        }
-        return fallback[lang], False, ["Soil test"]
+    
+    fallback = {
+        "en": "No fertilizer template available for this crop/stage. Provide crop and stage or run soil test.",
+        "kn": "ಈ ಬೆಳೆ/ಹಂತಕ್ಕೆ ಎರೆ ಖರೀದಿಗಾಗಿ ರೂಪರೆಖೆ ಲಭ್ಯವಿಲ್ಲ. ದಯವಿಟ್ಟು ಮಣ್ಣು ಪರೀಕ್ಷೆ ಮಾಡಿ."
+    }
+    return fallback[lang], False, ["Soil test"]
 
 
 # =========================================================
@@ -1601,73 +1694,8 @@ def get_mock_weather_for_district(district):
     }
 
 
-def fetch_weather_by_location(district: str):
-    """Fetch current weather from OpenWeather API."""
-    try:
-        url = (
-            f"https://api.openweathermap.org/data/2.5/weather?"
-            f"q={district}&appid={OPENWEATHER_KEY}&units=metric"
-        )
-        r = requests.get(url, timeout=10)
-        data = r.json()
 
-        if data.get("cod") != 200:
-            return None
 
-        return {
-            "temp": data["main"]["temp"],
-            "humidity": data["main"]["humidity"],
-            "wind": data["wind"]["speed"],
-            "condition": data["weather"][0]["main"],
-            "description": data["weather"][0]["description"],
-            "rain": data.get("rain", {}).get("1h", 0)
-        }
-    except:
-        return None
-
-def weather_suggestion_engine(weather, crop_stage=None, language="en"):
-    temp = weather["temp"]
-    humidity = weather["humidity"]
-    wind = weather["wind"]
-    rain = weather["rain"]
-    cond = weather["condition"]
-
-    suggestions = []
-
-    # Temperature Logic
-    if temp > 35:
-        suggestions.append("High heat – give afternoon irrigation and mulch.")
-    elif temp < 15:
-        suggestions.append("Low temperature – avoid fertilizer today.")
-
-    # Rain Logic
-    if rain > 3:
-        suggestions.append("Rainfall occurring – stop irrigation for 24 hours.")
-    else:
-        suggestions.append("No rain – irrigation recommended today.")
-
-    # Humidity Logic
-    if humidity > 80:
-        suggestions.append("High humidity – fungal disease chances are high.")
-    elif humidity < 35:
-        suggestions.append("Low humidity – increase irrigation frequency.")
-
-    # Wind Logic
-    if wind > 20:
-        suggestions.append("High wind – avoid spraying pesticides.")
-
-    # Crop-stage weather fusion
-    if crop_stage:
-        st = crop_stage.lower()
-        if "flower" in st and cond == "Rain":
-            suggestions.append("Rain during flowering – flower drop likely.")
-        if "harvest" in st and rain > 0:
-            suggestions.append("Rain coming – postpone harvest.")
-
-    if language == "kn":
-        suggestions = translate_weather_suggestions_kn(suggestions)
-
-    return suggestions
 
 
 def translate_weather_suggestions_kn(sugs):
@@ -1726,42 +1754,28 @@ def weather_advisory(user_id: str, language: str):
 def irrigation_schedule(crop: str, stage: str, user_id: str, lang: str) -> Tuple[str, bool, List[str]]:
     farm = get_user_farm_details(user_id)
     soil = (farm.get("soilType") or "loamy").lower()
-    area_ha = None
-    if isinstance(farm, dict):
-        try:
-            area_ha = float(farm.get("areaInHectares") or farm.get("area") or 1.0)
-        except Exception:
-            area_ha = 1.0
-    else:
+    try:
+        area_ha = float(farm.get("areaInHectares") or farm.get("area") or 1.0)
+    except Exception:
         area_ha = 1.0
-
     district = farm.get("district") or "unknown"
     weather = get_mock_weather_for_district(district)
     rain_next_24 = weather.get("rain_next_24h_mm", 0)
-
     crop_l = (crop or "").lower()
-    base_et = CROP_ET_BASE.get(crop_l, 4)  # mm/day default
+    base_et = CROP_ET_BASE.get(crop_l, 4)
     soil_factor = SOIL_WATER_HOLDING.get(soil, 1.0)
-
-    # Stage-based multiplier
     stage_mult = 1.0
-    if "nursery" in (stage or "").lower() or "vegetative" in (stage or "").lower():
+    s_low = (stage or "").lower()
+    if "nursery" in s_low or "vegetative" in s_low:
         stage_mult = 1.2
-    elif "flower" in (stage or "").lower() or "panicle" in (stage or "").lower():
+    elif "flower" in s_low or "panicle" in s_low:
         stage_mult = 1.1
-    elif "harvest" in (stage or "").lower():
+    elif "harvest" in s_low:
         stage_mult = 0.8
-
-    # Compute required irrigation mm/day (very simplified)
     required_mm = base_et * stage_mult * (1.0 / soil_factor)
     if rain_next_24 >= 10:
-        suggestion = {
-            "en": "Rain expected soon. Delay irrigation and monitor soil moisture.",
-            "kn": "ಶೀಘ್ರದಲ್ಲೇ ಮಳೆಯ ಸಂಭವನೆ. ನೀರಾವರಿ ತಡೆಯಿರಿ ಮತ್ತು ಮಣ್ಣು ஈರತೆಯನ್ನು ಪರಿಶೀಲಿಸಿರಿ."
-        }
+        suggestion = {"en": "Rain expected soon. Delay irrigation and monitor soil moisture.", "kn": "ಶೀಘ್ರದಲ್ಲೇ ಮಳೆಯ ಸಂಭವನೆ. ನೀರಾವರಿ ತಡೆಯಿರಿ ಮತ್ತು ಮಣ್ಣು ஈರತೆಯನ್ನು ಪರಿಶೀಲಿಸಿರಿ."}
         return suggestion[lang], False, ["Soil moisture check", "Delay irrigation"]
-
-    # convert mm/day to liters per ha: 1 mm = 10,000 liters per hectare
     liters_per_ha = required_mm * 10000
     total_liters = round(liters_per_ha * area_ha, 1)
     if lang == "kn":
@@ -1830,64 +1844,54 @@ BASE_YIELD_TON_PER_HA = {
 
 
 def yield_prediction(crop: str, user_id: str, lang: str) -> Tuple[str, bool, List[str]]:
-    """
-    Uses simple heuristics: base yield * factors (fertilizer adequacy, irrigation adequacy, pest control)
-    Tries to read simple indicators from Firebase: lastFertilizerApplied, irrigationLogs, pestIncidents
-    """
     farm = get_user_farm_details(user_id)
-    area_ha = None
-    if isinstance(farm, dict):
-        try:
-            area_ha = float(farm.get("areaInHectares") or farm.get("area") or 1.0)
-        except Exception:
-            area_ha = 1.0
-    else:
+    try:
+        area_ha = float(farm.get("areaInHectares") or farm.get("area") or 1.0)
+    except Exception:
         area_ha = 1.0
-
     crop_l = (crop or "").lower()
     base = BASE_YIELD_TON_PER_HA.get(crop_l, 2.0)
-
-    # read basic indicators
     last_fert = firebase_get(f"Users/{user_id}/lastFertilizerApplied") or {}
-    fert_ok = False
-    if isinstance(last_fert, dict) and last_fert.get("applied", False):
-        fert_ok = True
-
+    fert_ok = isinstance(last_fert, dict) and last_fert.get("applied", False)
     irrigation_logs = firebase_get(f"Users/{user_id}/irrigationLogs") or {}
     irrigation_ok = False
-    # if irrigation logs in last 14 days exist -> ok
     if isinstance(irrigation_logs, dict):
-        found_recent = False
         now = datetime.utcnow().timestamp()
-        for k, v in irrigation_logs.items():
-            ts = v.get("timestamp", 0)
+        for v in irrigation_logs.values():
+            try:
+                ts = int(v.get("timestamp", 0) or 0)
+            except Exception:
+                ts = 0
             if now - ts < 14 * 24 * 3600:
-                found_recent = True
+                irrigation_ok = True
                 break
-        irrigation_ok = found_recent
-
     pest_incidents = firebase_get(f"Users/{user_id}/pestIncidents") or {}
-    pest_control_ok = True
-    if isinstance(pest_incidents, dict) and len(pest_incidents) > 0:
-        # if recent major incidents present, reduce yield
-        pest_control_ok = False
-
-    # factor multipliers
+    pest_control_ok = not (isinstance(pest_incidents, dict) and len(pest_incidents) > 0)
     fert_factor = 1.1 if fert_ok else 0.9
     irr_factor = 1.05 if irrigation_ok else 0.9
     pest_factor = 0.95 if not pest_control_ok else 1.0
-
     predicted_ton_per_ha = round(base * fert_factor * irr_factor * pest_factor, 2)
     total_tonnage = round(predicted_ton_per_ha * area_ha, 2)
-
     if lang == "kn":
         text = (f"ಅಂದಾಜು ಉತ್ಪಾದನೆ: {predicted_ton_per_ha} ಟನ್/ha. ಒಟ್ಟು ~{total_tonnage} ಟನ್ ನಿಮ್ಮ {area_ha} ha ಪ್ರದೇಶಕ್ಕೆ.\n"
                 f"(ಕಾರಕಗಳು: fertilizer_ok={fert_ok}, irrigation_ok={irrigation_ok}, pest_ok={pest_control_ok})")
     else:
         text = (f"Estimated yield: {predicted_ton_per_ha} ton/ha. Total ~{total_tonnage} ton for {area_ha} ha.\n"
                 f"(Factors: fertilizer_ok={fert_ok}, irrigation_ok={irrigation_ok}, pest_ok={pest_control_ok})")
-
     return text, False, ["Improve irrigation", "Soil test", "Pest control"]
+
+def fetch_weather_by_location(district: str):
+    if not OPENWEATHER_KEY:
+        return None
+    try:
+        url = f"https://api.openweathermap.org/data/2.5/weather?q={district}&appid={OPENWEATHER_KEY}&units=metric"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        if data.get("cod") != 200:
+            return None
+        return {"temp": data["main"]["temp"], "humidity": data["main"]["humidity"], "wind": data["wind"]["speed"], "condition": data["weather"][0]["main"], "description": data["weather"][0]["description"], "rain": data.get("rain", {}).get("1h", 0)}
+    except Exception:
+        return None
 
 # =========================================================
 # CROP–DISEASE PREDICTION FROM WEATHER (Temp/Humidity/Rain)
@@ -2190,38 +2194,27 @@ def classify_weather_condition(weather):
         conds.append("heavy_rain")
 
     return conds
-def predict_disease_from_weather(crop, weather, lang):
-    crop = crop.lower()
-    if crop not in DISEASE_WEATHER_RISK:
-        return None  # No model available
 
+
+def predict_disease_from_weather(crop, weather, lang):
+    crop_l = (crop or "").lower()
+    if crop_l not in DISEASE_WEATHER_RISK:
+        return None
     weather_conditions = classify_weather_condition(weather)
     risks = []
-
-    for rule in DISEASE_WEATHER_RISK[crop]:
+    for rule in DISEASE_WEATHER_RISK[crop_l]:
         if rule["cond"] in weather_conditions:
             risks.append(rule["disease"])
-
     if not risks:
-        msg = {
-            "en": f"No major disease risk predicted for {crop.title()} based on current weather.",
-            "kn": f"ಪ್ರಸ್ತುತ ಹವಾಮಾನ ಆಧಾರದಲ್ಲಿ {crop} ಬೆಳೆಗೂ ಮುಖ್ಯ ರೋಗ ಅಪಾಯ ಕಂಡುಬಂದಿಲ್ಲ."
-        }
+        msg = {"en": f"No major disease risk predicted for {crop.title()} based on current weather.", "kn": f"ಪ್ರಸ್ತುತ ಹವಾಮಾನ ಆಧಾರದಲ್ಲಿ {crop} ಬೆಳೆಗೂ ಮುಖ್ಯ ರೋಗ ಅಪಾಯ ಕಂಡುಬಂದಿಲ್ಲ."}
         return msg[lang]
-
-    # Build response
     if lang == "kn":
-        text = f"{crop} ಬೆಳೆ ಹವಾಮಾನ ಆಧಾರಿತ ರೋಗ ಅಪಾಯ:\n\n"
-        for d in risks:
-            text += f"⚠ {d} ಅಪಾಯ ಹೆಚ್ಚು\n"
-        text += "\nತಡೆ ಕ್ರಮ: ನೀಮ್ ಸಿಂಪಡಣೆ / ಗಾಳಿ ಸಂಚಾರ ಹೆಚ್ಚಿಸಿ / ಜಲಾವೃತ ತಪ್ಪಿಸಿ."
+        text = f"{crop} ಬೆಳೆ ಹವಾಮಾನ ಆಧಾರಿತ ರೋಗ ಅಪಾಯ:\n\n" + "\n".join([f"⚠ {d} ಅಪಾಯ ಹೆಚ್ಚು" for d in risks]) + "\n\nತಡೆ ಕ್ರಮ: ನೀಮ್ ಸಿಂಪಡಣೆ / ಗಾಳಿ ಸಂಚಾರ ಹೆಚ್ಚಿಸಿ / ಜಲಾವೃತ ತಪ್ಪಿಸಿ."
     else:
-        text = f"Disease Risk Prediction for {crop.title()}:\n\n"
-        for d in risks:
-            text += f"⚠ High risk of {d}\n"
-        text += "\nPreventive actions: Neem spray / Improve aeration / Avoid waterlogging."
-
+        text = f"Disease Risk Prediction for {crop.title()}:\n\n" + "\n".join([f"⚠ High risk of {d}" for d in risks]) + "\n\nPreventive actions: Neem spray / Improve aeration / Avoid waterlogging."
     return text
+
+
 # =========================================================
 #NEW MODULE :SYMPTOM RECOGNITION
 # =========================================================
@@ -2357,47 +2350,31 @@ def _extract_symptom_keys(user_text: str, fuzzy_threshold: float = 0.6):
 def match_symptoms(text):
     return _extract_symptom_keys(text)
 
-# scoring engine
 def _score_candidates(symptom_keys: list, crop: Optional[str] = None):
-    """
-    For each matched symptom key, map to candidate diseases/pests from SYMPTOM_DB,
-    and accumulate weighted scores. Crop-specific boosts applied if crop known.
-    Returns list of (candidate, score, evidence_list).
-    """
+    from collections import defaultdict
     scores = defaultdict(float)
     evidence = defaultdict(list)
-
     for sk in symptom_keys:
         mapped = SYMPTOM_DB.get(sk, [])
         for cand in mapped:
-            # base weight: more specific symptom -> higher base
             base_weight = 1.0
-            # boost for longer/more specific keys
             if len(sk.split()) >= 2:
                 base_weight += 0.25
             scores[cand] += base_weight
             evidence[cand].append(f"symptom:{sk}")
-
-    # crop boost
     if crop:
         crop_l = crop.lower()
         crop_map = CROP_SYMPTOM_WEIGHT.get(crop_l, {})
         for cand, boost in crop_map.items():
-            # only apply if candidate exists in scoring or known disease
             scores[cand] += boost
             evidence[cand].append(f"crop_boost:{crop_l}")
-
-    # normalize & turn into sorted list
     if not scores:
         return []
-
-    # convert to sorted list of tuples (candidate, score, evidence)
     total = sum(scores.values())
     ranked = []
     for cand, sc in sorted(scores.items(), key=lambda x: -x[1]):
-        confidence = round(min(0.99, sc / (total + 1e-6)), 2)  # simplistic confidence
+        confidence = round(min(0.99, sc / (total + 1e-6)), 2)
         ranked.append((cand, round(sc, 2), confidence, evidence.get(cand, [])))
-
     return ranked
 
 
@@ -2421,89 +2398,96 @@ def diagnose_pest(user_text, language):
     
 # final diagnose function (public)
 def diagnose_advanced(user_text: str, user_crop: Optional[str] = None, lang: str = "en") -> Tuple[str, bool, list]:
-    """
-    Input:
-      - user_text: free text from farmer describing symptoms
-      - user_crop: optional crop name (from farm logs). If present, used for weighting
-      - lang: "en" or "kn" (language for fallback messages)
-    Output:
-      - response_text: a diagnostic message with top candidates, confidence & rationale
-      - voice_flag: whether this response could be read by TTS (we return False default)
-      - suggestions: list of actions (e.g., "Upload photo", "Pesticide recommendations", "Soil test")
-    """
     if not user_text or not user_text.strip():
-        fallback = {"en": "Please describe the symptoms (leaf color, spots, pests seen, part affected).",
-                    "kn": "ದಯವಿಟ್ಟು ಲಕ್ಷಣಗಳನ್ನು ವಿವರಿಸಿ (ಎಲೆ ಬಣ್ಣ, ಕಲೆ, ಕಂಡ ಹಾಳುಕಾರಕಗಳು, ಭಾಗ ಪ್ರಭಾವಿತವಾಗಿರುವುದು)."}
+        fallback = {"en": "Please describe the symptoms (leaf color, spots, pests seen, part affected).", "kn": "ದಯವಿಟ್ಟು ಲಕ್ಷಣಗಳನ್ನು ವಿವರಿಸಿ (ಎಲೆ ಬಣ್ಣ, ಕಲೆ, ಕಂಡ ಹಾಳುಕಾರಕಗಳು, ಭಾಗ ಪ್ರಭಾವಿತವಾಗಿರುವುದು)."}
         return fallback.get(lang, fallback["en"]), False, ["Upload photo", "Describe symptoms"]
-
-    # 1) extract symptom keys
     symptom_keys = _extract_symptom_keys(user_text, fuzzy_threshold=0.58)
-
-    # 2) if none found, try splitting into clauses and match again (aggressive)
     if not symptom_keys:
         clauses = re.split(r"[,.;:/\\-]", user_text)
         for clause in clauses:
             keys = _extract_symptom_keys(clause, fuzzy_threshold=0.55)
             symptom_keys.extend(keys)
-
-    # 3) dedupe
     symptom_keys = list(dict.fromkeys(symptom_keys))
-
     if not symptom_keys:
-        fallback = {"en": "Couldn't identify clear symptoms. Please provide more details or upload a photo.",
-                    "kn": "ನಿರ್ದಿಷ್ಟ ಲಕ್ಷಣಗಳು ಗುರುತಿಸಲಾಗಲಿಲ್ಲ. ದಯವಿಟ್ಟು ಹೆಚ್ಚಿನ ವಿವರ ನೀಡಿ ಅಥವಾ ಫೋಟೋ ಅಪ್ಲೋಡ್ ಮಾಡಿ."}
+        fallback = {"en": "Couldn't identify clear symptoms. Please provide more details or upload a photo.", "kn": "ನಿರ್ದಿಷ್ಟ ಲಕ್ಷಣಗಳು ಗುರುತಿಸಲಾಗಲಿಲ್ಲ. ದಯವಿಟ್ಟು ಹೆಚ್ಚಿನ ವಿವರ ನೀಡಿ ಅಥವಾ ಫೋಟೋ ಅಪ್ಲೋಡ್ ಮಾಡಿ."}
         return fallback.get(lang, fallback["en"]), False, ["Upload photo", "Contact Krishi Adhikari"]
-
-    # 4) score candidate pests/diseases
     ranked = _score_candidates(symptom_keys, user_crop)
-
     if not ranked:
-        fallback = {"en": "No candidate pests/diseases found for those symptoms.",
-                    "kn": "ಆ ಲಕ್ಷಣಗಳಿಗೆ ಯೋಗ್ಯವಾದ ಕೀಟ/ರೋಗಗಳು ಕಂಡುಬರಲಿಲ್ಲ."}
+        fallback = {"en": "No candidate pests/diseases found for those symptoms.", "kn": "ಆ ಲಕ್ಷಣಗಳಿಗೆ ಯೋಗ್ಯವಾದ ಕೀಟ/ರೋಗಗಳು ಕಂಡುಬರಲಿಲ್ಲ."}
         return fallback.get(lang, fallback["en"]), False, ["Upload photo", "Contact Krishi Adhikari"]
-
-    # 5) build response text with top 3 candidates, confidence & evidence
     top_k = ranked[:3]
     lines = []
-    if lang == "kn":
-        header = "ಸರಾಸರಿ ಅನುಮಾನಿತ ರೋಗ/ಕೀಟಗಳು (ಮೇಲವರ್ಗ):\n"
-    else:
-        header = "Likely pests/diseases (top candidates):\n"
+    header = "Likely pests/diseases (top candidates):\n" if lang == "en" else "ಸರಾಸರಿ ಅನುಮಾನಿತ ರೋಗ/ಕೀಟಗಳು (ಮೇಲವರ್ಗ):\n"
     lines.append(header)
-
     for cand, score, conf, ev in top_k:
-        # friendly meta if available
         meta = DISEASE_META.get(cand, {})
         meta_note = meta.get("note", "")
         lines.append(f"- {cand.title()} (confidence: {int(conf*100)}%)")
         if meta_note:
             lines.append(f"    • {meta_note}")
         lines.append(f"    • Evidence: {', '.join(ev)}")
-
-    # 6) suggestions and recommended actions: map to PESTICIDE_DB if available
     suggestions = ["Upload photo", "Contact Krishi Adhikari", "View prevention steps"]
     rec_texts = []
     for cand, score, conf, ev in top_k:
-        # if an exact pesticide recommendation exists in PESTICIDE_DB for this key -> include it
         key = cand.lower()
         if key in PESTICIDE_DB:
             rec = PESTICIDE_DB[key].get(lang if lang in ["en", "kn"] else "en")
             if rec:
                 rec_texts.append(f"For {cand.title()}: {rec}")
-
     if rec_texts:
         lines.append("\nSuggested interventions:")
         for r in rec_texts:
             lines.append(f"- {r}")
         suggestions.insert(0, "Pesticide recommendations")
-
-    # optional: include the normalized symptom keys found
     lines.append("\nIdentified symptoms:")
     for s in symptom_keys:
         lines.append(f"- {s}")
-
     final_text = "\n".join(lines)
     return final_text, False, suggestions
+
+def weather_suggestion_engine(weather, crop_stage=None, language="en"):
+    temp = weather["temp"]
+    humidity = weather["humidity"]
+    wind = weather["wind"]
+    rain = weather["rain"]
+    cond = weather["condition"]
+
+    suggestions = []
+
+    # Temperature Logic
+    if temp > 35:
+        suggestions.append("High heat – give afternoon irrigation and mulch.")
+    elif temp < 15:
+        suggestions.append("Low temperature – avoid fertilizer today.")
+
+    # Rain Logic
+    if rain > 3:
+        suggestions.append("Rainfall occurring – stop irrigation for 24 hours.")
+    else:
+        suggestions.append("No rain – irrigation recommended today.")
+
+    # Humidity Logic
+    if humidity > 80:
+        suggestions.append("High humidity – fungal disease chances are high.")
+    elif humidity < 35:
+        suggestions.append("Low humidity – increase irrigation frequency.")
+
+    # Wind Logic
+    if wind > 20:
+        suggestions.append("High wind – avoid spraying pesticides.")
+
+    # Crop-stage weather fusion
+    if crop_stage:
+        st = crop_stage.lower()
+        if "flower" in st and cond == "Rain":
+            suggestions.append("Rain during flowering – flower drop likely.")
+        if "harvest" in st and rain > 0:
+            suggestions.append("Rain coming – postpone harvest.")
+
+    if language == "kn":
+        suggestions = translate_weather_suggestions_kn(suggestions)
+
+    return suggestions
 
 
 
@@ -2552,73 +2536,185 @@ def get_prompt(lang: str) -> str:
 
 
 def crop_advisory(user_id: str, query: str, lang: str, session_key: str):
-    global client, active_chats
+    global gemini_client, active_chats
     try:
-        if not client:
+        if not gemini_client:
             return "AI not configured on server.", False, [], session_key
         if session_key not in active_chats:
+            if types is None:
+                return "AI configuration incomplete.", False, [], session_key
             cfg = types.GenerateContentConfig(system_instruction=get_prompt(lang))
-            chat = client.chats.create(model="gemini-2.0-flash-lite", config=cfg)
+            chat = gemini_client.chats.create(model="gemini-1.5-flash", config=cfg)
             active_chats[session_key] = chat
         chat = active_chats[session_key]
-        try:
-            resp=chat.send_message(query)
-        except:
-            error_str=str(e)
-             if "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower():
-                fallback_text = (
-                    "⚠️ AI quota limit reached for today.\n"
-                    "Please try again later. (Free-tier limit exceeded)"
-                    if lang == "en"
-                    else "⚠️ ಇಂದಿಗಿನ AI ಬಳಕೆ ಮಿತಿ ಮೀರಿದೆ.\n"
-                         "ಸ್ವಲ್ಪ ಹೊತ್ತಿನ ನಂತರ ಮತ್ತೆ ಪ್ರಯತ್ನಿಸಿ."
-                )
-                return fallback_text, False, ["Try again later"], session_key
-            safe_error = (
-                "AI is currently unavailable. Please try again later."
-                if lang == "en"
-                else "AI ಪ್ರಸ್ತುತ ಲಭ್ಯವಿಲ್ಲ. ದಯವಿಟ್ಟು ನಂತರ ಪ್ರಯತ್ನಿಸಿ."
-            )
-            return safe_error, False, [], session_key
+        resp = chat.send_message(query)
         text = resp.text if hasattr(resp, "text") else str(resp)
         return text, False, ["Crop stage", "Pest check", "Soil test"], session_key
 
             
-    except Exception:
-        fallback = (
-            "AI could not process your request."
-            if lang == "en"
-            else "AI ನಿಮ್ಮ ವಿನಂತಿಯನ್ನು ಸಂಸ್ಕರಿಸಲು ಸಾಧ್ಯವಾಗಲಿಲ್ಲ."
-        )
-        return fallback, False, [], session_key
+    except Exception as e:
+        logger.exception("AI error: %s", e)
+        return f"AI error: {e}", False, [], session_key
+        
+
+
+
 
 
 # =========================================================
-# Crop stage retrieval (latest activity)
+# Router — identify intents and call modules
 # =========================================================
-def get_latest_crop_stage(user_id: str, lang: str):
-    logs = firebase_get(f"Users/{user_id}/farmActivityLogs")
-    if not logs:
-        return ("No farm activity found." if lang == "en" else "ಫಾರಂ ಚಟುವಟಿಕೆ ಕಂಡುಬರಲಿಲ್ಲ."), False, ["Add activity"]
+def route(query: str, user_id: str, lang: str, session_key: str):
+    q = query.lower().strip()
 
-    latest_ts = -1
-    latest_crop = None
-    latest_stage = None
-    for crop, entries in logs.items():
-        if isinstance(entries, dict):
-            for act_id, data in entries.items():
-                ts = data.get("timestamp", 0)
-                if ts and ts > latest_ts:
-                    latest_ts = ts
-                    latest_crop = data.get("cropName", crop)
-                    latest_stage = data.get("stage", "Unknown")
-    # build response with stage-wise recommendation
-    rec = stage_recommendation_engine(latest_crop, latest_stage, lang)
-    if lang == "kn":
-        header = f"{latest_crop} ಬೆಳೆ ಪ್ರಸ್ತುತ ಹಂತ: {latest_stage}\n\n"
-    else:
-        header = f"Current stage of {latest_crop}: {latest_stage}\n\n"
-    return header + rec, False, ["Next actions", "Fertilizer advice", "Pest check"]
+    # simple intent checks (order matters)
+    if any(tok in q for tok in ["soil test", "soil testing", "soil centre", "soil center"]):
+        t, v, s = soil_testing_center(user_id, lang)
+        return {"response_text": t, "voice": v, "suggestions": s}
+
+    if any(tok in q for tok in ["timeline", "activity log", "farm activity"]):
+        t, v, s = farm_timeline(user_id, lang)
+        return {"response_text": t, "voice": v, "suggestions": s}
+
+    if any(tok in q for tok in ["weather", "rain", "forecast"]) and "stage" not in q:
+        report, sug, voice = weather_advisory(lang)
+        return {"response_text": report, "voice": voice, "suggestions": sug}
+
+
+    if any(tok in q for tok in ["price", "market", "mandi"]):
+        t, v, s = market_price(query, lang)
+        return {"response_text": t, "voice": v, "suggestions": s}
+
+    if "crop stage" in q or q == "stage" or ("stage" in q and len(q.split()) < 6):
+        t, v, s = get_latest_crop_stage(user_id, lang)
+        return {"response_text": t, "voice": v, "suggestions": s}
+    
+    if any(tok in q for tok in ["pest", "disease", "leaf", "spots", "yellowing", "curl", "blight", "fungus"]):
+        # prefer advanced diagnosis if symptoms present
+        diag_text, voice, sugg = diagnose_advanced(query, user_crop=get_latest_crop_and_stage(user_id)[0], lang=lang)
+        return {"response_text": diag_text, "voice": voice, "suggestions": sugg}
+
+    # fertilizer intent: user can say "fertilizer" or "how much fertilizer"
+    if "fertilizer" in q or "fertiliser" in q or "apply fertilizer" in q:
+        latest_crop, latest_stage = get_latest_crop_and_stage(user_id)
+        if not latest_crop:
+            msg = ("Please provide the crop and stage (e.g., 'fertilizer for paddy tillering')" if lang == "en" else "ದಯವಿಟ್ಟು ಬೆಳೆ ಮತ್ತು ಹಂತವನ್ನು ನೀಡಿ (ಉದಾ: 'fertilizer for paddy tillering')")
+            return {"response_text": msg, "voice": False, "suggestions": ["Provide crop & stage"]}
+        t, v, s = fertilizer_calculator(latest_crop, latest_stage, user_id, lang)
+        return {"response_text": t, "voice": v, "suggestions": s}
+
+    # pesticide intent: user asks "what to spray for aphid" or "pesticide for fruit borer"
+    if "pesticide" in q or "spray" in q or "aphid" in q or "fruit borer" in q:
+        # try to extract pest name (simple)
+        pest = None
+        for key in PESTICIDE_DB.keys():
+            if key in q:
+                pest = key
+                break
+        if not pest:
+            # fallback ask
+            msg = ("Please tell me the pest name or upload a photo (e.g., 'aphid')." if lang == "en"
+                   else "ದಯವಿಟ್ಟು ಕೀಟದ ಹೆಸರು ಅಥವಾ ಫೋಟೋ ನೀಡಿ (ಉದಾ: aphid).")
+            return {"response_text": msg, "voice": False, "suggestions": ["Upload photo", "aphid"]}
+        t, v, s = pesticide_recommendation("", pest, lang)
+        return {"response_text": t, "voice": v, "suggestions": s}
+
+    # irrigation intent
+    if "irrigation" in q or "water" in q or "irrigate" in q:
+        # try latest crop & stage
+        logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
+        latest_crop = None; latest_stage = None; latest_ts = -1
+        for crop, entries in logs.items() if isinstance(logs, dict) else []:
+            if isinstance(entries, dict):
+                for aid, data in entries.items():
+                    ts = data.get("timestamp", 0)
+                    if ts and ts > latest_ts:
+                        latest_ts = ts
+                        latest_crop = data.get("cropName", crop)
+                        latest_stage = data.get("stage", "")
+        if not latest_crop:
+            msg = ("Provide crop & stage for irrigation advice." if lang == "en" else "ನೀರಾವರಿ ಸಲಹೆಗೆ ಬೆಳೆ ಮತ್ತು ಹಂತ ನೀಡಿ.")
+            return {"response_text": msg, "voice": False, "suggestions": ["Provide crop & stage"]}
+        t, v, s = irrigation_schedule(latest_crop, latest_stage, user_id, lang)
+        return {"response_text": t, "voice": v, "suggestions": s}
+
+    # yield prediction intent
+    if "yield" in q or "estimate" in q or "production" in q:
+        # try to extract crop name; fallback to latest crop
+        crop = None
+        for c in BASE_YIELD_TON_PER_HA.keys():
+            if c in q:
+                crop = c
+                break
+        if not crop:
+            logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
+            latest_crop = None; latest_ts = -1
+            for crop_k, entries in logs.items() if isinstance(logs, dict) else []:
+                if isinstance(entries, dict):
+                    for aid, data in entries.items():
+                        ts = data.get("timestamp", 0)
+                        if ts and ts > latest_ts:
+                            latest_ts = ts
+                            latest_crop = data.get("cropName", crop_k)
+            crop = latest_crop or list(BASE_YIELD_TON_PER_HA.keys())[0]
+        t, v, s = yield_prediction(crop, user_id, lang)
+        return {"response_text": t, "voice": v, "suggestions": s}
+
+    # weather + crop stage fusion intent
+    if "weather" in q and "stage" in q:
+        latest_crop, latest_stage = get_latest_crop_and_stage(user_id)
+        if not latest_crop:
+            return {"response_text": "No crop found. Add crop activity.", "voice": False, "suggestions": ["Add activity"]}
+        text, v, s = weather_crop_fusion(user_id, latest_crop, latest_stage, lang)
+        return {"response_text": text, "voice": v, "suggestions": s}
+        
+    # ----------------------------------------------------------------------
+    # WEATHER-BASED DISEASE PREDICTION
+    # ----------------------------------------------------------------------
+    if "disease" in q and "weather" in q:
+        latest_crop, _ = get_latest_crop_and_stage(user_id)
+        if not latest_crop:
+            return {"response_text": "No crop found. Add farm activity.", "voice": False, "suggestions": ["Add activity"]}
+        farm = get_user_farm_details(user_id)
+        weather = fetch_weather_by_location(farm.get("district", "unknown"))
+        if not weather:
+            return {"response_text": "Weather unavailable.", "voice": False, "suggestions": ["Retry"]}
+        result = predict_disease_from_weather(latest_crop, weather, lang)
+        return {"response_text": result, "voice": False, "suggestions": ["Pest check", "Preventive spray"]}
+
+    # ----------------------------------------------------------------------
+    # ADVANCED PEST/DISEASE DIAGNOSIS (SYMPTOM BASED)
+    # ----------------------------------------------------------------------
+    if any(tok in q for tok in ["pest", "disease", "symptom", "leaf", "spots", "yellowing", "curl", "blight", "fungus"]):
+        logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
+        latest_crop = None
+        latest_ts = -1
+
+        for crop_k, entries in logs.items() if isinstance(logs, dict) else []:
+            if isinstance(entries, dict):
+                for aid, data in entries.items():
+                    ts = data.get("timestamp", 0)
+                    if ts > latest_ts:
+                        latest_ts = ts
+                        latest_crop = data.get("cropName", crop_k)
+
+        diag_text, voice, sugg = diagnose_advanced(query, user_crop=latest_crop, lang=lang)
+        return {
+            "response_text": diag_text,
+            "voice": voice,
+            "suggestions": sugg
+        }
+
+    # General agriculture knowledge intent
+    gen_text, gen_voice, gen_sugg = general_agri_knowledge_engine(query, lang)
+    if gen_text:
+        return {"response_text": gen_text, "voice": gen_voice, "suggestions": gen_sugg}
+
+
+    # Default → Gemini crop advisory or fallback text
+    t, v, s, sid = crop_advisory(user_id, query, lang, session_key)
+    return {"response_text": t, "voice": v, "suggestions": s, "session_id": sid}
+
 # =========================================================
 # GENERAL AGRICULTURE KNOWLEDGE ENGINE
 # =========================================================
@@ -2691,208 +2787,32 @@ def general_agri_knowledge_engine(query: str, lang: str) -> Tuple[str, bool, lis
         )
 
     return None, None, None
-
-
 # =========================================================
-# Router — identify intents and call modules
+# Crop stage retrieval (latest activity)
 # =========================================================
-def route(query: str, user_id: str, lang: str, session_key: str):
-    q = query.lower().strip()
+def get_latest_crop_stage(user_id: str, lang: str):
+    logs = firebase_get(f"Users/{user_id}/farmActivityLogs")
+    if not logs:
+        return ("No farm activity found." if lang == "en" else "ಫಾರಂ ಚಟುವಟಿಕೆ ಕಂಡುಬರಲಿಲ್ಲ."), False, ["Add activity"]
 
-    # simple intent checks (order matters)
-    if any(tok in q for tok in ["soil test", "soil testing", "soil centre", "soil center"]):
-        return {"response_text": soil_testing_center(user_id, lang)[0], "voice": True, "suggestions": ["Update farm details"]}
-
-    if any(tok in q for tok in ["timeline", "activity log", "farm activity"]):
-        t, v, s = farm_timeline(user_id, lang)
-        return {"response_text": t, "voice": v, "suggestions": s}
-
-    if any(tok in q for tok in ["weather", "rain", "forecast"]):
-        report, sug, voice = weather_advisory(user_id, lang)
-        return {"response_text": report, "voice": voice, "suggestions": sug}
-
-
-    if any(tok in q for tok in ["price", "market", "mandi"]):
-        t, v, s = market_price(query, lang)
-        return {"response_text": t, "voice": v, "suggestions": s}
-
-    if "crop stage" in q or q == "stage" or "stage" in q:
-        t, v, s = get_latest_crop_stage(user_id, lang)
-        return {"response_text": t, "voice": v, "suggestions": s}
-
-    if any(tok in q for tok in ["pest", "disease", "leaf", "spots", "yellowing", "curl", "blight", "fungus"]):
-        t, v, s = pest_disease(query, lang)
-        return {"response_text": t, "voice": v, "suggestions": s}
-
-    # fertilizer intent: user can say "fertilizer" or "how much fertilizer"
-    if "fertilizer" in q or "fertiliser" in q or "apply fertilizer" in q:
-        # try to pick crop & stage from user's farm (latest)
-        logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
-        latest_crop = None; latest_stage = None; latest_ts = -1
-        for crop, entries in logs.items() if isinstance(logs, dict) else []:
-            if isinstance(entries, dict):
-                for aid, data in entries.items():
-                    ts = data.get("timestamp", 0)
-                    if ts and ts > latest_ts:
-                        latest_ts = ts
-                        latest_crop = data.get("cropName", crop)
-                        latest_stage = data.get("stage", "")
-        if not latest_crop:
-            # fallback ask user to provide crop & stage
-            msg = ("Please provide the crop and stage (e.g., 'fertilizer for paddy tillering')"
-                   if lang == "en" else "ದಯವಿಟ್ಟು ಬೆಳೆ ಮತ್ತು ಹಂತವನ್ನು ನೀಡಿ (ಉದಾ: 'fertilizer for paddy tillering')")
-            return {"response_text": msg, "voice": False, "suggestions": ["Provide crop & stage"]}
-        t, v, s = fertilizer_calculator(latest_crop, latest_stage, user_id, lang)
-        return {"response_text": t, "voice": v, "suggestions": s}
-
-    # pesticide intent: user asks "what to spray for aphid" or "pesticide for fruit borer"
-    if "pesticide" in q or "spray" in q or "aphid" in q or "fruit borer" in q:
-        # try to extract pest name (simple)
-        pest = None
-        for key in PESTICIDE_DB.keys():
-            if key in q:
-                pest = key
-                break
-        if not pest:
-            # fallback ask
-            msg = ("Please tell me the pest name or upload a photo (e.g., 'aphid')." if lang == "en"
-                   else "ದಯವಿಟ್ಟು ಕೀಟದ ಹೆಸರು ಅಥವಾ ಫೋಟೋ ನೀಡಿ (ಉದಾ: aphid).")
-            return {"response_text": msg, "voice": False, "suggestions": ["Upload photo", "aphid"]}
-        t, v, s = pesticide_recommendation("", pest, lang)
-        return {"response_text": t, "voice": v, "suggestions": s}
-
-    # irrigation intent
-    if "irrigation" in q or "water" in q or "irrigate" in q:
-        # try latest crop & stage
-        logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
-        latest_crop = None; latest_stage = None; latest_ts = -1
-        for crop, entries in logs.items() if isinstance(logs, dict) else []:
-            if isinstance(entries, dict):
-                for aid, data in entries.items():
-                    ts = data.get("timestamp", 0)
-                    if ts and ts > latest_ts:
-                        latest_ts = ts
-                        latest_crop = data.get("cropName", crop)
-                        latest_stage = data.get("stage", "")
-        if not latest_crop:
-            msg = ("Provide crop & stage for irrigation advice." if lang == "en" else "ನೀರಾವರಿ ಸಲಹೆಗೆ ಬೆಳೆ ಮತ್ತು ಹಂತ ನೀಡಿ.")
-            return {"response_text": msg, "voice": False, "suggestions": ["Provide crop & stage"]}
-        t, v, s = irrigation_schedule(latest_crop, latest_stage, user_id, lang)
-        return {"response_text": t, "voice": v, "suggestions": s}
-
-    # yield prediction intent
-    if "yield" in q or "estimate" in q or "production" in q:
-        # try to extract crop name; fallback to latest crop
-        crop = None
-        for c in BASE_YIELD_TON_PER_HA.keys():
-            if c in q:
-                crop = c
-                break
-        if not crop:
-            logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
-            latest_crop = None; latest_ts = -1
-            for crop_k, entries in logs.items() if isinstance(logs, dict) else []:
-                if isinstance(entries, dict):
-                    for aid, data in entries.items():
-                        ts = data.get("timestamp", 0)
-                        if ts and ts > latest_ts:
-                            latest_ts = ts
-                            latest_crop = data.get("cropName", crop_k)
-            crop = latest_crop or list(BASE_YIELD_TON_PER_HA.keys())[0]
-        t, v, s = yield_prediction(crop, user_id, lang)
-        return {"response_text": t, "voice": v, "suggestions": s}
-
-    # weather + crop stage fusion intent
-    if "weather" in q and "stage" in q:
-        logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
-        # extract latest crop/stage
-        latest_crop = None; latest_stage = None; latest_ts = -1
-        for crop, entries in logs.items() if isinstance(logs, dict) else []:
-            if isinstance(entries, dict):
-                for _, data in entries.items():
-                    ts = data.get("timestamp", 0)
-                    if ts > latest_ts:
-                        latest_crop = data.get("cropName", crop)
-                        latest_stage = data.get("stage", "")
-        if not latest_crop:
-            return {"response_text": "No crop found. Add crop activity.", "voice": False, "suggestions": ["Add activity"]}
-
-        text, v, s = weather_crop_fusion(user_id, latest_crop, latest_stage, lang)
-        return {"response_text": text, "voice": v, "suggestions": s}
-        
-        # ----------------------------------------------------------------------
-    # WEATHER-BASED DISEASE PREDICTION
-    # ----------------------------------------------------------------------
-    if "disease" in q and "weather" in q:
-        logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
-        latest_crop = None
-        latest_ts = -1
-
-        for crop, entries in logs.items() if isinstance(logs, dict) else []:
-            if isinstance(entries, dict):
-                for _, data in entries.items():
-                    ts = data.get("timestamp", 0)
-                    if ts > latest_ts:
-                        latest_ts = ts
-                        latest_crop = data.get("cropName", crop)
-
-        if not latest_crop:
-            return {
-                "response_text": "No crop found. Add farm activity.",
-                "voice": False,
-                "suggestions": ["Add activity"]
-            }
-
-        farm = get_user_farm_details(user_id)
-        weather = fetch_weather_by_location(farm.get("district", "unknown"))
-
-        if not weather:
-            return {
-                "response_text": "Weather unavailable.",
-                "voice": False,
-                "suggestions": ["Retry"]
-            }
-
-        result = predict_disease_from_weather(latest_crop, weather, lang)
-        return {
-            "response_text": result,
-            "voice": False,
-            "suggestions": ["Pest check", "Preventive spray"]
-        }
-
-    # ----------------------------------------------------------------------
-    # ADVANCED PEST/DISEASE DIAGNOSIS (SYMPTOM BASED)
-    # ----------------------------------------------------------------------
-    if any(tok in q for tok in ["pest", "disease", "symptom", "leaf", "spots", "yellowing", "curl", "blight", "fungus"]):
-        logs = firebase_get(f"Users/{user_id}/farmActivityLogs") or {}
-        latest_crop = None
-        latest_ts = -1
-
-        for crop_k, entries in logs.items() if isinstance(logs, dict) else []:
-            if isinstance(entries, dict):
-                for aid, data in entries.items():
-                    ts = data.get("timestamp", 0)
-                    if ts > latest_ts:
-                        latest_ts = ts
-                        latest_crop = data.get("cropName", crop_k)
-
-        diag_text, voice, sugg = diagnose_advanced(query, user_crop=latest_crop, lang=lang)
-        return {
-            "response_text": diag_text,
-            "voice": voice,
-            "suggestions": sugg
-        }
-
-    # General agriculture knowledge intent
-    gen_text, gen_voice, gen_sugg = general_agri_knowledge_engine(query, lang)
-    if gen_text:
-        return {"response_text": gen_text, "voice": gen_voice, "suggestions": gen_sugg}
-
-
-    # Default → Gemini crop advisory or fallback text
-    t, v, s, sid = crop_advisory(user_id, query, lang, session_key)
-    return {"response_text": t, "voice": v, "suggestions": s, "session_id": sid}
-
+    latest_ts = -1
+    latest_crop = None
+    latest_stage = None
+    for crop, entries in logs.items():
+        if isinstance(entries, dict):
+            for act_id, data in entries.items():
+                ts = data.get("timestamp", 0)
+                if ts and ts > latest_ts:
+                    latest_ts = ts
+                    latest_crop = data.get("cropName", crop)
+                    latest_stage = data.get("stage", "Unknown")
+    # build response with stage-wise recommendation
+    rec = stage_recommendation_engine(latest_crop, latest_stage, lang)
+    if lang == "kn":
+        header = f"{latest_crop} ಬೆಳೆ ಪ್ರಸ್ತುತ ಹಂತ: {latest_stage}\n\n"
+    else:
+        header = f"Current stage of {latest_crop}: {latest_stage}\n\n"
+    return header + rec, False, ["Next actions", "Fertilizer advice", "Pest check"]
 
 # =========================================================
 # Endpoint
@@ -2945,5 +2865,6 @@ async def chat_send(payload: ChatQuery):
 def startup():
     initialize_firebase_credentials()
     initialize_gemini()
+
 
 
