@@ -1,5 +1,6 @@
 import os
 import requests
+import json
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel
 from google import genai
@@ -223,4 +224,5 @@ async def chat_with_gemini(query: ChatQuery):
 def startup_event():
     initialize_firebase_credentials()
     initialize_gemini_client()
+
 
