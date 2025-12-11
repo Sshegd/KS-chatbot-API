@@ -2553,44 +2553,67 @@ def get_prompt(lang: str) -> str:
 
 def crop_advisory(user_id: str, query: str, lang: str, session_key: str):
     global client, active_chats
+
     try:
+        # Ensure Gemini client is initialized
         if not client:
-            return "AI not configured on server.", False, [], session_key
+            return (
+                "AI not configured on server."
+                if lang == "en"
+                else "AI ಸರ್ವರ್‌ನಲ್ಲಿ ಸಂರಚನೆಯಾಗಿಲ್ಲ."
+            ), False, [], session_key
+
+        # Create new chat session if not exists
         if session_key not in active_chats:
             cfg = types.GenerateContentConfig(system_instruction=get_prompt(lang))
             chat = client.chats.create(model="gemini-2.5-flash", config=cfg)
             active_chats[session_key] = chat
+
         chat = active_chats[session_key]
+
+        # Try sending query to Gemini
         try:
-            resp=chat.send_message(query)
-        except:
-            error_str=str(e)
-             if "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower():
+            resp = chat.send_message(query)
+
+        except Exception as e:
+            error_str = str(e)
+
+            # Handle free-tier quota exhaustion
+            if (
+                "RESOURCE_EXHAUSTED" in error_str
+                or "quota" in error_str.lower()
+                or "exceeded" in error_str.lower()
+            ):
                 fallback_text = (
-                    "⚠️ AI quota limit reached for today.\n"
-                    "Please try again later. (Free-tier limit exceeded)"
+                    "⚠️ AI quota limit reached for today.\nPlease try again later."
                     if lang == "en"
-                    else "⚠️ ಇಂದಿಗಿನ AI ಬಳಕೆ ಮಿತಿ ಮೀರಿದೆ.\n"
-                         "ಸ್ವಲ್ಪ ಹೊತ್ತಿನ ನಂತರ ಮತ್ತೆ ಪ್ರಯತ್ನಿಸಿ."
+                    else "⚠️ AI ಬಳಕೆ ಮಿತಿ ಮೀರಿದೆ.\nಸ್ವಲ್ಪ ಹೊತ್ತಿನ ನಂತರ ಮತ್ತೆ ಪ್ರಯತ್ನಿಸಿ."
                 )
                 return fallback_text, False, ["Try again later"], session_key
+
+            # Any other AI error
             safe_error = (
                 "AI is currently unavailable. Please try again later."
                 if lang == "en"
                 else "AI ಪ್ರಸ್ತುತ ಲಭ್ಯವಿಲ್ಲ. ದಯವಿಟ್ಟು ನಂತರ ಪ್ರಯತ್ನಿಸಿ."
             )
             return safe_error, False, [], session_key
+
+        # Extract model text
         text = resp.text if hasattr(resp, "text") else str(resp)
+
+        # Normal response
         return text, False, ["Crop stage", "Pest check", "Soil test"], session_key
 
-            
     except Exception:
+        # Fatal fallback error
         fallback = (
             "AI could not process your request."
             if lang == "en"
             else "AI ನಿಮ್ಮ ವಿನಂತಿಯನ್ನು ಸಂಸ್ಕರಿಸಲು ಸಾಧ್ಯವಾಗಲಿಲ್ಲ."
         )
         return fallback, False, [], session_key
+
 
 
 # =========================================================
@@ -2945,5 +2968,6 @@ async def chat_send(payload: ChatQuery):
 def startup():
     initialize_firebase_credentials()
     initialize_gemini()
+
 
 
