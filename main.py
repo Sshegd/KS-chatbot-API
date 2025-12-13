@@ -4091,6 +4091,20 @@ def live_weather_advisory(user_id: str, lang: str):
 
 def route(query: str, user_id: str, lang: str, session_key: str):
     q = query.lower().strip()
+    # 🆘 HELP / GENERAL REQUEST (NO SUGGESTIONS)
+    if q in ["help", "more info", "information", "details", "guide",
+         "ಸಹಾಯ", "ಮಾಹಿತಿ", "ಇನ್ನಷ್ಟು", "ವಿವರ"]:
+        text = (
+            "I can help you with farming questions like crop issues, pests, weather, irrigation, fertilizer, and market prices. Please ask your question."
+            if lang == "en"
+            else
+                "ನಾನು ಬೆಳೆ, ಕೀಟ, ಹವಾಮಾನ, ನೀರಾವರಿ, ರಸಗೊಬ್ಬರ ಮತ್ತು ಮಾರುಕಟ್ಟೆ ಬೆಲೆ ಕುರಿತು ಸಹಾಯ ಮಾಡುತ್ತೇನೆ. ದಯವಿಟ್ಟು ನಿಮ್ಮ ಪ್ರಶ್ನೆಯನ್ನು ಕೇಳಿ."
+        )
+        return {
+            "response_text": text,
+            "voice": False,
+            "suggestions": []   # 🔥 IMPORTANT
+        }
 
     # ===============================
     # 🌾 1 — NDVI Query
@@ -4262,12 +4276,17 @@ def route(query: str, user_id: str, lang: str, session_key: str):
         "voice": v,
         "suggestions": s
     }
-# Default fallback
     return {
-        "response_text": "I didn't understand." if lang == "en" else "ನನಗೆ ಅರ್ಥವಾಗಲಿಲ್ಲ.",
+        "response_text": (
+            "Please ask your farming question with a little more detail."
+            if lang == "en"
+            else
+                "ದಯವಿಟ್ಟು ನಿಮ್ಮ ಕೃಷಿ ಸಂಬಂಧಿತ ಪ್ರಶ್ನೆಯನ್ನು ಸ್ವಲ್ಪ ವಿವರವಾಗಿ ಕೇಳಿ."
+        ),
         "voice": False,
-        "suggestions": ["Help"]
+        "suggestions": []   # 🔥 no chips
     }
+
 
     # 10 — Gemini fallback
     global client
@@ -4337,6 +4356,7 @@ async def chat_send(payload: ChatQuery):
 def startup():
     initialize_firebase_credentials()
     initialize_gemini()
+
 
 
 
