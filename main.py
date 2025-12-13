@@ -4041,69 +4041,49 @@ def fetch_weather_live(district: str):
         return None
 
 def live_weather_advisory(user_id: str, lang: str):
-    farm = get_user_farm_details(user_id)
-    district = farm.get("district")
+    loc = get_user_location(user_id)
 
-    if not district:
-        return {
-            "en": "Update district in farm details.",
-            "kn": "ಜಿಲ್ಲೆ ಮಾಹಿತಿಯನ್ನು ನವೀಕರಿಸಿ."
-        }[lang], False, ["Update farm details"]
+    if not loc or not loc.get("district"):
+        return (
+            "Please update your farm district to get weather information."
+            if lang == "en"
+            else "ಹವಾಮಾನ ಮಾಹಿತಿ ಪಡೆಯಲು ನಿಮ್ಮ ಫಾರಂ ಜಿಲ್ಲೆಯ ಮಾಹಿತಿಯನ್ನು ನವೀಕರಿಸಿ.",
+            False,
+            ["Update farm details"]
+        )
 
-    weather = fetch_weather_live(district)
+    district = loc["district"]
 
+    weather = fetch_weather_by_location(district)
     if not weather:
-        return {
-            "en": "Unable to fetch live weather.",
-            "kn": "ಹವಾಮಾನ ಪಡೆಯಲಾಗಲಿಲ್ಲ."
-        }[lang], False, []
+        return (
+            "Unable to fetch weather at the moment."
+            if lang == "en"
+            else "ಪ್ರಸ್ತುತ ಹವಾಮಾನ ಪಡೆಯಲು ಸಾಧ್ಯವಾಗುತ್ತಿಲ್ಲ.",
+            False,
+            ["Try again"]
+        )
 
-    # Build response
-    if lang == "en":
-        text = (
-            f"Weather in {district}:\n"
-            f"• Temp: {weather['temp']}°C\n"
-            f"• Humidity: {weather['humidity']}%\n"
-            f"• Rain (1h): {weather['rain']}mm\n"
-            f"• Wind: {weather['wind']} km/h\n"
-            f"• Condition: {weather['condition']}\n"
+    if lang == "kn":
+        report = (
+            f"{district} – ಇಂದಿನ ಹವಾಮಾನ:\n"
+            f"ಸ್ಥಿತಿ: {weather['description']}\n"
+            f"ತಾಪಮಾನ: {weather['temp']}°C\n"
+            f"ತೇವಾಂಶ: {weather['humidity']}%\n"
+            f"ಗಾಳಿ: {weather['wind']} km/h\n"
+            f"ಮಳೆ: {weather['rain']} mm"
         )
     else:
-        text = (
-            f"{district} ಹವಾಮಾನ:\n"
-            f"• ತಾಪಮಾನ: {weather['temp']}°C\n"
-            f"• ತೇವಾಂಶ: {weather['humidity']}%\n"
-            f"• ಮಳೆ (1h): {weather['rain']}mm\n"
-            f"• ಗಾಳಿ: {weather['wind']} km/h\n"
-            f"• ಸ್ಥಿತಿ: {weather['condition']}\n"
+        report = (
+            f"Today's weather in {district}:\n"
+            f"Condition: {weather['description']}\n"
+            f"Temperature: {weather['temp']}°C\n"
+            f"Humidity: {weather['humidity']}%\n"
+            f"Wind: {weather['wind']} km/h\n"
+            f"Rain: {weather['rain']} mm"
         )
 
-    # Weather-based advice
-    extra = []
-    if weather["temp"] > 34:
-        extra.append("High temperature — irrigate crops.")
-    if weather["humidity"] > 85:
-        extra.append("High humidity — fungal diseases likely.")
-    if weather["rain"] > 5:
-        extra.append("Heavy rain — avoid fertilizer today.")
-
-    # Kannada translation
-    if lang == "kn":
-        extra_kn = []
-        for e in extra:
-            if "High temperature" in e:
-                extra_kn.append("ಹೆಚ್ಚು ಬಿಸಿಲು — ನೀರಾವರಿ ಮಾಡಿ.")
-            if "fungal" in e:
-                extra_kn.append("ಹೆಚ್ಚು ತೇವಾಂಶ — ಫಂಗಸ್ ರೋಗ ಸಾಧ್ಯತೆ.")
-            if "avoid fertilizer" in e:
-                extra_kn.append("ಹೆಚ್ಚು ಮಳೆ — ಗೊಬ್ಬರ ಬೇಡ.")
-        extra = extra_kn
-
-    if extra:
-        text += "\n" + "\n".join("• " + e for e in extra)
-
-    return text, False, ["Disease risk", "Irrigation advice"]
-
+    return report, True, ["Irrigation advice", "Crop stage", "Pest risk"]
 
 # ---------------------------------------------------------
 # MAIN ROUTER LOGIC
@@ -4264,12 +4244,14 @@ def route(query: str, user_id: str, lang: str, session_key: str):
     # ===============================
     # ☁️ Live weather advisory
     # ===============================
-    if any(w in q for w in [
-        "weather", "rain", "temperature",
-        "ಹವಮಾನ", "ಮಳೆ", "ತಾಪಮಾನ", "ಗಾಳಿ"
+    # 🌦 WEATHER QUERY (English + Kannada)
+    if any(k in q for k in [
+        "weather", "rain", "temperature", "forecast",
+        "ಹವಾಮಾನ", "ಮಳೆ", "ಇಂದು ಹವಾಮಾನ", "ಇಂದಿನ ಹವಾಮಾನ", "ತಾಪಮಾನ"
     ]):
         t, v, s = live_weather_advisory(user_id, lang)
         return {"response_text": t, "voice": v, "suggestions": s}
+
 
     # ===============================
     # 🌱 FINAL SAFE FALLBACK — GENERAL AGRICULTURE HELP
@@ -4355,6 +4337,7 @@ async def chat_send(payload: ChatQuery):
 def startup():
     initialize_firebase_credentials()
     initialize_gemini()
+
 
 
 
