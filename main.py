@@ -3948,6 +3948,44 @@ def profitability_ranking_engine(user_id: str, lang: str):
     return text, False, ["Suggest best crop", "Market price"]
 
 
+def general_agri_fallback(lang: str):
+    if lang == "kn":
+        return (
+            "ನಾನು ಕೃಷಿಗೆ ಸಂಬಂಧಿಸಿದ ಸಾಮಾನ್ಯ ಸಲಹೆಗಳನ್ನು ನೀಡಬಹುದು.\n\n"
+            "🌾 ಬೆಳೆ ನಿರ್ವಹಣೆ\n"
+            "💧 ನೀರಾವರಿ ಸಲಹೆ\n"
+            "🐛 ಕೀಟ ಮತ್ತು ರೋಗ ಪರಿಹಾರ\n"
+            "🧪 ರಸಗೊಬ್ಬರ ಮಾರ್ಗದರ್ಶನ\n"
+            "☁️ ಹವಾಮಾನ ಆಧಾರಿತ ಸಲಹೆ\n\n"
+            "ದಯವಿಟ್ಟು ನಿಮ್ಮ ಪ್ರಶ್ನೆಯನ್ನು ಸ್ವಲ್ಪ ವಿವರವಾಗಿ ಕೇಳಿ.",
+            False,
+            [
+                "ಬೆಳೆ ಹಂತ",
+                "ಇಂದು ಹವಾಮಾನ",
+                "ರಸಗೊಬ್ಬರ ಸಲಹೆ",
+                "ನೀರಾವರಿ",
+                "ಕೀಟ ಸಮಸ್ಯೆ"
+            ]
+        )
+    else:
+        return (
+            "I can help you with general agriculture guidance such as:\n\n"
+            "🌾 Crop management\n"
+            "💧 Irrigation advice\n"
+            "🐛 Pest & disease control\n"
+            "🧪 Fertilizer guidance\n"
+            "☁️ Weather-based suggestions\n\n"
+            "Please ask your question with a little more detail.",
+            False,
+            [
+                "Crop stage",
+                "Today's weather",
+                "Fertilizer advice",
+                "Irrigation",
+                "Pest problem"
+            ]
+        )
+
 # =========================================================
 # PART 3 — ROUTER + API ENDPOINT + STARTUP
 # =========================================================
@@ -4233,7 +4271,16 @@ def route(query: str, user_id: str, lang: str, session_key: str):
         t, v, s = live_weather_advisory(user_id, lang)
         return {"response_text": t, "voice": v, "suggestions": s}
 
-    # Default fallback
+    # ===============================
+    # 🌱 FINAL SAFE FALLBACK — GENERAL AGRICULTURE HELP
+    # ===============================    
+    t, v, s = general_agri_fallback(lang)
+    return {
+        "response_text": t,
+        "voice": v,
+        "suggestions": s
+    }
+# Default fallback
     return {
         "response_text": "I didn't understand." if lang == "en" else "ನನಗೆ ಅರ್ಥವಾಗಲಿಲ್ಲ.",
         "voice": False,
@@ -4308,6 +4355,7 @@ async def chat_send(payload: ChatQuery):
 def startup():
     initialize_firebase_credentials()
     initialize_gemini()
+
 
 
 
