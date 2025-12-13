@@ -595,6 +595,194 @@ def diagnose_advanced(text: str, crop: Optional[str], lang: str):
     return resp, False, ["Pesticide advice", "Prevention"]
 
 # =========================================================
+# GOVERNMENT SCHEMES MODULE
+# =========================================================
+
+GOVT_SCHEMES = {
+    "pm kisan": {
+        "en": "PM-Kisan provides ₹6000/year to farmers in 3 installments. Eligibility: small & marginal farmers with land records.",
+        "kn": "PM-Kisan ಯೋಜನೆ ರೈತರಿಗೆ ವರ್ಷಕ್ಕೆ ₹6000 ನೆರವು ನೀಡುತ್ತದೆ. ಅರ್ಹತೆ: ಭೂ ದಾಖಲೆ ಇರುವ ಸಣ್ಣ ಮತ್ತು ಅಂಚಿನ ರೈತರು."
+    },
+    "pmfby": {
+        "en": "PMFBY crop insurance covers yield loss due to drought, flood, pest attack & natural calamities.",
+        "kn": "PMFBY ಬೆಳೆ ವಿಮೆ ಬರ, ನೆರೆ, ಕೀಟ, ಮತ್ತು ಪ್ರಕೃತಿ ವಿಕೋಪಗಳಿಂದ ಆಗುವ ನಷ್ಟವನ್ನು ಹೊರುತ್ತದೆ."
+    },
+    "soil health card": {
+        "en": "Soil Health Card provides nutrient status of soil and fertilizer recommendations every 2 years.",
+        "kn": "ಮಣ್ಣು ಆರೋಗ್ಯ ಕಾರ್ಡ್ ಮಣ್ಣಿನ ಪೋಷಕಾಂಶ ಸ್ಥಿತಿ ಮತ್ತು ಗೊಬ್ಬರ ಸಲಹೆ ನೀಡುತ್ತದೆ."
+    },
+    "kcc": {
+        "en": "Kisan Credit Card offers low-interest crop loans up to ₹3 lakhs.",
+        "kn": "ಕಿಸಾನ್ ಕ್ರೆಡಿಟ್ ಕಾರ್ಡ್ (KCC) ಕಡಿಮೆ ಬಡ್ಡಿದರದ ಬೆಳೆ ಸಾಲ ಒದಗಿಸುತ್ತದೆ."
+    },
+    "drip subsidy": {
+        "en": "Government offers 55–75% subsidy on drip & sprinkler irrigation under PMKSY.",
+        "kn": "PMKSY ಯಡಿಯಲ್ಲಿ ಡ್ರಿಪ್ ಮತ್ತು ಸ್ಪ್ರಿಂಕ್ಲರ್ ನೀರಾವರಿಗೆ 55–75% ಸಹಾಯಧನ ಲಭ್ಯ."
+    }
+}
+
+def govt_scheme_engine(query: str, lang: str):
+    q = query.lower()
+    for scheme, info in GOVT_SCHEMES.items():
+        if scheme in q:
+            return info[lang], False, ["Eligibility", "How to apply"]
+
+    # General scheme intent
+    if "scheme" in q or "yojana" in q or "subsidy" in q:
+        response = {
+            "en": "Available schemes: PM-Kisan, PMFBY crop insurance, Soil Health Card, KCC loan, PMKSY drip subsidy.",
+            "kn": "ಲಭ್ಯವಿರುವ ಯೋಜನೆಗಳು: PM-Kisan, PMFBY ಬೆಳೆ ವಿಮೆ, ಮಣ್ಣು ಆರೋಗ್ಯ ಕಾರ್ಡ್, KCC ಸಾಲ, PMKSY ಡ್ರಿಪ್ ಸಹಾಯಧನ."
+        }
+        return response[lang], False, ["PM-Kisan", "PMFBY", "KCC"]
+
+    return None
+
+# =========================================================
+# CROP RECOMMENDATION ENGINE (SOIL + CLIMATE)
+# =========================================================
+
+SOIL_TO_CROP = {
+    "red soil": ["Groundnut", "Millet", "Pigeon pea", "Cotton"],
+    "black soil": ["Cotton", "Soybean", "Paddy", "Red gram"],
+    "loamy": ["Vegetables", "Paddy", "Wheat", "Sugarcane"],
+    "sandy": ["Groundnut", "Watermelon", "Cucumber"],
+    "clay": ["Paddy", "Banana", "Sugarcane"]
+}
+
+CLIMATE_TO_CROP = {
+    "dry": ["Millet", "Sorghum", "Castor", "Pigeon pea"],
+    "semi-dry": ["Cotton", "Groundnut", "Bengal gram"],
+    "humid": ["Paddy", "Banana", "Arecanut", "Spices"],
+    "coastal": ["Coconut", "Arecanut", "Paddy", "Cashew"]
+}
+
+def detect_climate_from_district(district: str):
+    district = district.lower()
+
+    dry = ["chitradurga", "ballari", "tumkur", "bijapur"]
+    humid = ["shivamogga", "udupi", "dakshina kannada"]
+    coastal = ["karwar", "mangalore"]
+    semi_dry = ["haveri", "davanagere", "chikkaballapur"]
+
+    if district in dry:
+        return "dry"
+    if district in humid:
+        return "humid"
+    if district in coastal:
+        return "coastal"
+    if district in semi_dry:
+        return "semi-dry"
+    return "semi-dry"
+def crop_recommendation_engine(user_id: str, lang: str):
+    farm = get_user_farm_details(user_id)
+
+    soil = farm.get("soilType", "").lower()
+    pH = farm.get("soilPH")
+    district = farm.get("district", "unknown")
+
+    if not soil:
+        return {
+            "en": "Update soil type in farm details.",
+            "kn": "ಫಾರಂ ವಿವರಗಳಲ್ಲಿ ಮಣ್ಣಿನ ವಿಧ ಸೇರಿಸಿ."
+        }[lang], False, ["Update soil details"]
+
+    climate = detect_climate_from_district(district)
+
+    # soil-based
+    soil_based = SOIL_TO_CROP.get(soil, [])
+
+    # climate-based
+    climate_based = CLIMATE_TO_CROP.get(climate, [])
+
+    # combined recommendation
+    common = list(set(soil_based) & set(climate_based))
+    if not common:
+        common = soil_based or climate_based
+
+    # pH-based refinement
+    if pH:
+        if pH < 6.0:
+            common.append("Lime application recommended before planting.")
+        elif pH > 8.0:
+            common.append("Choose alkaline-tolerant crops like Cotton, Castor.")
+
+    text = (
+        f"Recommended crops for your soil & climate: {', '.join(common)}"
+        if lang == "en" else
+        f"ನಿಮ್ಮ ಮಣ್ಣು & ಹವಾಮಾನಕ್ಕೆ ಶಿಫಾರಸು ಮಾಡಿದ ಬೆಳೆಗಳು: {', '.join(common)}"
+    )
+
+    return text, False, ["Show fertilizer schedule", "Pest-resistant varieties"]
+# =========================================================
+# MARKET PRICE–BASED PROFITABILITY ENGINE
+# =========================================================
+
+# Average cost of cultivation per hectare (rough estimates)
+CROP_COST = {
+    "paddy": 45000,
+    "chilli": 80000,
+    "banana": 120000,
+    "groundnut": 50000,
+    "cotton": 65000,
+    "ragi": 30000,
+    "maize": 35000
+}
+
+# Market price per kg (fallback if APMC not connected)
+MARKET_PRICE = {
+    "paddy": 20,
+    "chilli": 70,
+    "banana": 10,
+    "groundnut": 50,
+    "cotton": 60,
+    "ragi": 25,
+    "maize": 20
+}
+
+# Expected yield per hectare (tonne → convert to kg)
+CROP_YIELD = {
+    "paddy": 5 * 1000,
+    "chilli": 2 * 1000,
+    "banana": 40 * 1000,
+    "groundnut": 2.5 * 1000,
+    "cotton": 2 * 1000,
+    "ragi": 1.5 * 1000,
+    "maize": 3 * 1000
+}
+
+def profitability_ranking_engine(user_id: str, lang: str):
+    farm = get_user_farm_details(user_id)
+    area = float(farm.get("areaInHectares", 1.0))
+
+    ranking = []
+
+    for crop in CROP_COST.keys():
+        cost = CROP_COST[crop]
+        price = MARKET_PRICE[crop]
+        yield_kg = CROP_YIELD[crop]
+
+        revenue = yield_kg * price
+        profit = revenue - cost
+
+        ranking.append((crop, profit))
+
+    ranking.sort(key=lambda x: x[1], reverse=True)
+
+    top3 = ranking[:3]
+
+    if lang == "en":
+        text = "Top profitable crops:\n"
+        for crop, prof in top3:
+            text += f"• {crop.title()}: Profit ₹{prof:,} per hectare\n"
+    else:
+        text = "ಅತ್ಯಂತ ಲಾಭದಾಯಕ ಬೆಳೆಗಳು:\n"
+        for crop, prof in top3:
+            text += f"• {crop.title()}: ಲಾಭ ₹{prof:,} / ಹೆಕ್ಟೇರ್\n"
+
+    return text, False, ["Suggest best crop", "Market price"]
+
+
+# =========================================================
 # PART 3 — ROUTER + API ENDPOINT + STARTUP
 # =========================================================
 
@@ -627,13 +815,90 @@ def get_latest_crop_stage(user_id: str):
 # WEATHER FETCHER (LIGHTWEIGHT)
 # ---------------------------------------------------------
 
-def fetch_weather(district: str):
-    # Weather disabled or no API — use simple fallback
-    return {
-        "temp": 30,
-        "humidity": 70,
-        "rain": 0
-    }
+def fetch_weather_live(district: str):
+    try:
+        url = (
+            f"https://api.openweathermap.org/data/2.5/weather?"
+            f"q={district}&appid={OPENWEATHER_KEY}&units=metric"
+        )
+        data = requests.get(url, timeout=10).json()
+
+        if data.get("cod") != 200:
+            return None
+
+        return {
+            "temp": data["main"]["temp"],
+            "humidity": data["main"]["humidity"],
+            "rain": data.get("rain", {}).get("1h", 0),
+            "wind": data["wind"]["speed"],
+            "condition": data["weather"][0]["description"]
+        }
+    except:
+        return None
+
+def live_weather_advisory(user_id: str, lang: str):
+    farm = get_user_farm_details(user_id)
+    district = farm.get("district")
+
+    if not district:
+        return {
+            "en": "Update district in farm details.",
+            "kn": "ಜಿಲ್ಲೆ ಮಾಹಿತಿಯನ್ನು ನವೀಕರಿಸಿ."
+        }[lang], False, ["Update farm details"]
+
+    weather = fetch_weather_live(district)
+
+    if not weather:
+        return {
+            "en": "Unable to fetch live weather.",
+            "kn": "ಹವಾಮಾನ ಪಡೆಯಲಾಗಲಿಲ್ಲ."
+        }[lang], False, []
+
+    # Build response
+    if lang == "en":
+        text = (
+            f"Weather in {district}:\n"
+            f"• Temp: {weather['temp']}°C\n"
+            f"• Humidity: {weather['humidity']}%\n"
+            f"• Rain (1h): {weather['rain']}mm\n"
+            f"• Wind: {weather['wind']} km/h\n"
+            f"• Condition: {weather['condition']}\n"
+        )
+    else:
+        text = (
+            f"{district} ಹವಾಮಾನ:\n"
+            f"• ತಾಪಮಾನ: {weather['temp']}°C\n"
+            f"• ತೇವಾಂಶ: {weather['humidity']}%\n"
+            f"• ಮಳೆ (1h): {weather['rain']}mm\n"
+            f"• ಗಾಳಿ: {weather['wind']} km/h\n"
+            f"• ಸ್ಥಿತಿ: {weather['condition']}\n"
+        )
+
+    # Weather-based advice
+    extra = []
+    if weather["temp"] > 34:
+        extra.append("High temperature — irrigate crops.")
+    if weather["humidity"] > 85:
+        extra.append("High humidity — fungal diseases likely.")
+    if weather["rain"] > 5:
+        extra.append("Heavy rain — avoid fertilizer today.")
+
+    # Kannada translation
+    if lang == "kn":
+        extra_kn = []
+        for e in extra:
+            if "High temperature" in e:
+                extra_kn.append("ಹೆಚ್ಚು ಬಿಸಿಲು — ನೀರಾವರಿ ಮಾಡಿ.")
+            if "fungal" in e:
+                extra_kn.append("ಹೆಚ್ಚು ತೇವಾಂಶ — ಫಂಗಸ್ ರೋಗ ಸಾಧ್ಯತೆ.")
+            if "avoid fertilizer" in e:
+                extra_kn.append("ಹೆಚ್ಚು ಮಳೆ — ಗೊಬ್ಬರ ಬೇಡ.")
+        extra = extra_kn
+
+    if extra:
+        text += "\n" + "\n".join("• " + e for e in extra)
+
+    return text, False, ["Disease risk", "Irrigation advice"]
 
 
 # ---------------------------------------------------------
@@ -725,6 +990,27 @@ def route(query: str, user_id: str, lang: str, session_key: str):
     if offline:
         return {"response_text": offline, "voice": False, "suggestions": ["More info"]}
 
+    # Government scheme queries
+    ans = govt_scheme_engine(query, lang)
+    if ans:
+        t, v, s = ans
+        return {"response_text": t, "voice": v, "suggestions": s}
+
+    # Crop recommendation query
+    if "recommend crop" in q or "best crop" in q or "which crop" in q:
+        t, v, s = crop_recommendation_engine(user_id, lang)
+        return {"response_text": t, "voice": v, "suggestions": s}
+
+        # Profitability ranking
+    if "profit" in q or "profitable" in q or "best crop" in q:
+        t, v, s = profitability_ranking_engine(user_id, lang)
+        return {"response_text": t, "voice": v, "suggestions": s}
+
+        # Live weather
+    if "weather" in q or "rain" in q or "temperature" in q:
+        t, v, s = live_weather_advisory(user_id, lang)
+        return {"response_text": t, "voice": v, "suggestions": s}
+
     # 10 — Gemini fallback
     global client
     try:
@@ -793,5 +1079,6 @@ async def chat_send(payload: ChatQuery):
 def startup():
     initialize_firebase_credentials()
     initialize_gemini()
+
 
 
