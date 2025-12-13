@@ -4074,13 +4074,23 @@ def live_weather_advisory(user_id: str, lang: str):
 def route(query: str, user_id: str, lang: str, session_key: str):
     q = query.lower().strip()
 
-    # 1 — NDVI Query
-    if "ndvi" in q or "crop health" in q or "satellite" in q:
+    # ===============================
+    # 🌾 1 — NDVI Query
+    # ===============================
+    if any(w in q for w in [
+        "ndvi", "crop health", "satellite",
+        "ಎನ್‌ಡಿವಿಐ", "ಬಯಲು ಆರೋಗ್ಯ", "ಉಪಗ್ರಹ"
+    ]):
         t, v, s = ndvi_health_report(user_id, lang)
         return {"response_text": t, "voice": v, "suggestions": s}
 
-    # 2 — Stage request
-    if "stage" in q or "crop stage" in q:
+    # ===============================
+    # 🌱 2 — Stage request
+    # ===============================
+    if any(w in q for w in [
+        "stage", "crop stage",
+        "ಹಂತ", "ಬೆಳೆ ಹಂತ"
+    ]):
         crop, stage = get_latest_crop_stage(user_id)
         if not crop:
             return {
@@ -4095,8 +4105,13 @@ def route(query: str, user_id: str, lang: str, session_key: str):
             "suggestions": ["Fertilizer", "Pest check"]
         }
 
-    # 3 — Fertilizer query
-    if "fertilizer" in q or "fertiliser" in q:
+    # ===============================
+    # 💧 3 — Fertilizer query
+    # ===============================
+    if any(w in q for w in [
+        "fertilizer", "fertiliser",
+        "ರಸಗೊಬ್ಬರ", "ಗೊಬ್ಬರ", "ಗೊಬ್ಬರ ಸಲಹೆ"
+    ]):
         crop, stage = get_latest_crop_stage(user_id)
         if not crop:
             return {
@@ -4107,8 +4122,13 @@ def route(query: str, user_id: str, lang: str, session_key: str):
         t, v, s = fertilizer_calculator(crop, stage, user_id, lang)
         return {"response_text": t, "voice": v, "suggestions": s}
 
-    # 4 — Irrigation query
-    if "irrigation" in q or "water" in q:
+    # ===============================
+    # 🚰 4 — Irrigation query
+    # ===============================
+    if any(w in q for w in [
+        "irrigation", "water",
+        "ನೀರಾವರಿ", "ನೀರು", "ನೀರಿನ ಪ್ರಮಾಣ"
+    ]):
         crop, stage = get_latest_crop_stage(user_id)
         if not crop:
             return {
@@ -4119,16 +4139,26 @@ def route(query: str, user_id: str, lang: str, session_key: str):
         t, v, s = irrigation_schedule(crop, stage, user_id, lang)
         return {"response_text": t, "voice": v, "suggestions": s}
 
-    # 5 — Yield query
-    if "yield" in q or "production" in q:
+    # ===============================
+    # 🌾 5 — Yield query
+    # ===============================
+    if any(w in q for w in [
+        "yield", "production",
+        "ಉತ್ಪಾದನೆ", "ಫಲಿತಾಂಶ"
+    ]):
         crop, _ = get_latest_crop_stage(user_id)
         if not crop:
             crop = "paddy"
         t, v, s = yield_prediction(crop, user_id, lang)
         return {"response_text": t, "voice": v, "suggestions": s}
 
-    # 6 — Pesticide query
-    if "pesticide" in q or "spray" in q:
+    # ===============================
+    # 🐛 6 — Pesticide query
+    # ===============================
+    if any(w in q for w in [
+        "pesticide", "spray",
+        "ಕೀಟನಾಶಕ", "ಸಿಂಪಡಣೆ", "ಸಿಂಪಡಿಸು"
+    ]):
         for pest in PESTICIDE_DB.keys():
             if pest in q:
                 t, v, s = pesticide_recommendation("", pest, lang)
@@ -4139,43 +4169,76 @@ def route(query: str, user_id: str, lang: str, session_key: str):
             "suggestions": ["Aphid", "Thrips"]
         }
 
-    # 7 — Symptom diagnosis
-    if any(tok in q for tok in ["symptom", "spot", "yellow", "curl", "leaf"]):
+    # ===============================
+    # 🍂 7 — Symptom diagnosis
+    # ===============================
+    if any(tok in q for tok in [
+        "symptom", "spot", "yellow", "curl", "leaf",
+        "ಲಕ್ಷಣ", "ಕಲೆ", "ಹಳದಿ", "ಕರ್ಲ್", "ಎಲೆ"
+    ]):
         crop, _ = get_latest_crop_stage(user_id)
         t, v, s = diagnose_advanced(query, crop, lang)
         return {"response_text": t, "voice": v, "suggestions": s}
 
-    # 8 — Agriculture Q&A engine (100+ topics)
+    # ===============================
+    # 📘 8 — Agriculture Q&A (100+ topics)
+    # ===============================
     ans = agri_llm_engine(query, lang)
     if ans:
         t, v, s = ans
         return {"response_text": t, "voice": v, "suggestions": s}
 
-    # 9 — Offline fallback
+    # ===============================
+    # 🧱 9 — Offline fallback
+    # ===============================
     offline = offline_fallback(query, lang)
     if offline:
         return {"response_text": offline, "voice": False, "suggestions": ["More info"]}
 
-    # Government scheme queries
+    # ===============================
+    # 🏛 Government schemes
+    # ===============================
     ans = govt_scheme_engine(query, lang)
     if ans:
         t, v, s = ans
         return {"response_text": t, "voice": v, "suggestions": s}
 
-    # Crop recommendation query
-    if "recommend crop" in q or "best crop" in q or "which crop" in q:
+    # ===============================
+    # 🌾 Crop recommendation
+    # ===============================
+    if any(w in q for w in [
+        "recommend crop", "best crop", "which crop",
+        "ಯಾವ ಬೆಳೆ", "ಉತ್ತಮ ಬೆಳೆ", "ಶಿಫಾರಸು ಬೆಳೆ"
+    ]):
         t, v, s = crop_recommendation_engine(user_id, lang)
         return {"response_text": t, "voice": v, "suggestions": s}
 
-        # Profitability ranking
-    if "profit" in q or "profitable" in q or "best crop" in q:
+    # ===============================
+    # 💰 Profit / profitability
+    # ===============================
+    if any(w in q for w in [
+        "profit", "profitable",
+        "ಲಾಭ", "ಲಾಭದಾಯಕ"
+    ]):
         t, v, s = profitability_ranking_engine(user_id, lang)
         return {"response_text": t, "voice": v, "suggestions": s}
 
-        # Live weather
-    if "weather" in q or "rain" in q or "temperature" in q:
+    # ===============================
+    # ☁️ Live weather advisory
+    # ===============================
+    if any(w in q for w in [
+        "weather", "rain", "temperature",
+        "ಹವಮಾನ", "ಮಳೆ", "ತಾಪಮಾನ", "ಗಾಳಿ"
+    ]):
         t, v, s = live_weather_advisory(user_id, lang)
         return {"response_text": t, "voice": v, "suggestions": s}
+
+    # Default fallback
+    return {
+        "response_text": "I didn't understand." if lang == "en" else "ನನಗೆ ಅರ್ಥವಾಗಲಿಲ್ಲ.",
+        "voice": False,
+        "suggestions": ["Help"]
+    }
 
     # 10 — Gemini fallback
     global client
@@ -4245,6 +4308,7 @@ async def chat_send(payload: ChatQuery):
 def startup():
     initialize_firebase_credentials()
     initialize_gemini()
+
 
 
 
